@@ -1,18 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ─────────────────────────────────────────────
-# Homestack Setup Script (repo-friendly)
-# - Assumes this script is run from a git-cloned repo
-# - Reads optional files relative to the script directory
-# - Works on Debian (incl. trixie) by installing docker.io from Debian repos
-# - Uses service names for inter-container networking (mosquitto, influxdb, etc.)
-# - Provides host access from containers via host.docker.internal (compose extra_hosts)
-# ─────────────────────────────────────────────
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$SCRIPT_DIR/data"
-DOCKER="docker" # will be set by detect_docker_cmd()
+
+DOCKER="docker"
+COMPOSE=""   # will become either: "$DOCKER compose" OR "docker-compose"/"sudo docker-compose"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
@@ -20,36 +13,66 @@ warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 detect_docker_cmd() {
-  # Prefer plain docker; fall back to sudo docker if group membership isn't active yet
+  # Prefer plain docker; fall back to sudo docker if permissions aren't active yet
   if command -v docker &>/dev/null && docker ps &>/dev/null; then
     DOCKER="docker"
-    return
-  fi
-  if command -v docker &>/dev/null; then
+  elif command -v docker &>/dev/null; then
     DOCKER="sudo docker"
-    return
-  fi
-  DOCKER="docker"
-}
-
-require_compose() {
-  if ! $DOCKER compose version &>/dev/null; then
-    err "Docker Compose plugin not found. Install 'docker-compose-plugin' (Debian/Ubuntu) then re-run."
+  else
+    DOCKER="docker"
   fi
 }
 
-# ─────────────────────────────────────────────
-# 1. Install Docker if missing (Debian-safe)
-# ─────────────────────────────────────────────
-install_docker() {
-  if command -v docker &>/dev/null; then
-    log "Docker already installed: $(docker --version)"
-    detect_docker_cmd
+detect_compose_cmd() {
+  # Prefer Compose v2 plugin: "docker compose"
+  if $DOCKER compose version &>/dev/null; then
+    COMPOSE="$DOCKER compose"
     return
   fi
 
-  log "Installing Docker..."
+  # Fallback to legacy v1: "docker-compose"
+  if command -v docker-compose &>/dev/null; then
+    if [[ "$DOCKER" == sudo\ docker ]]; then
+      COMPOSE="sudo docker-compose"
+    else
+      COMPOSE="docker-compose"
+    fi
+    return
+  fi
 
+  COMPOSE=""
+}
+
+purge_bad_docker_apt_repo() {
+  # Removes the broken ubuntu docker repo line that caused: "... linux/ubuntu trixie Release ..."
+  local pattern="download.docker.com/linux/ubuntu"
+  local hits=()
+
+  while IFS= read -r -d '' f; do
+    hits+=("$f")
+  done < <(grep -RIlZ "$pattern" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true)
+
+  if ((${#hits[@]} == 0)); then
+    return
+  fi
+
+  warn "Found APT entries pointing to Docker's Ubuntu repo (this breaks apt on Debian trixie)."
+  for f in "${hits[@]}"; do
+    if [[ "$f" == "/etc/apt/sources.list" ]]; then
+      warn "The bad entry is in /etc/apt/sources.list (not auto-editing). Remove that line manually, then re-run."
+      continue
+    fi
+    warn "Removing broken repo file: $f"
+    sudo rm -f "$f"
+  done
+
+  if [[ -f /etc/apt/keyrings/docker.gpg ]]; then
+    warn "Removing /etc/apt/keyrings/docker.gpg (cleanup)"
+    sudo rm -f /etc/apt/keyrings/docker.gpg
+  fi
+}
+
+install_docker_and_compose() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
@@ -57,56 +80,53 @@ install_docker() {
     err "/etc/os-release not found; cannot detect distro"
   fi
 
-  if command -v apt-get &>/dev/null; then
-    sudo apt-get update -qq
-
-    if [[ "${ID:-}" == "debian" ]]; then
-      # Debian (incl. trixie/testing): use Debian packages (reliable)
-      sudo apt-get install -y docker.io docker-compose-plugin
-      sudo systemctl enable --now docker
-
-    elif [[ "${ID:-}" == "ubuntu" ]]; then
-      # Ubuntu: Docker CE from docker.com repo
-      sudo apt-get install -y ca-certificates curl gnupg lsb-release
-      sudo install -m 0755 -d /etc/apt/keyrings
-      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-        | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
-        | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-
-      sudo apt-get update -qq
-      sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-      sudo systemctl enable --now docker
-
-    else
-      err "apt-get detected but unsupported distro ID='${ID:-unknown}'. Install Docker manually."
-    fi
-
-  elif command -v dnf &>/dev/null; then
-    sudo dnf -y install dnf-plugins-core
-    sudo dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
-    sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin
-    sudo systemctl enable --now docker
-
-  elif command -v pacman &>/dev/null; then
-    sudo pacman -Sy --noconfirm docker docker-compose
-    sudo systemctl enable --now docker
-
-  else
-    err "Unsupported package manager. Install Docker manually: https://docs.docker.com/engine/install/"
+  if ! command -v apt-get &>/dev/null; then
+    err "This script currently expects apt-get on your system. Install Docker/Compose manually otherwise."
   fi
 
-  sudo usermod -aG docker "$USER"
-  warn "Added '$USER' to the 'docker' group. You may need to log out/in for non-sudo docker."
+  # If you previously added the wrong docker repo, apt-get update will fail until removed
+  if [[ "${ID:-}" == "debian" ]]; then
+    purge_bad_docker_apt_repo
+  fi
 
+  sudo apt-get update
+
+  # Install Docker Engine
+  if ! command -v docker &>/dev/null; then
+    log "Installing Docker Engine from OS repos..."
+    sudo apt-get install -y docker.io
+    sudo systemctl enable --now docker
+  else
+    log "Docker already installed: $(docker --version)"
+  fi
+
+  sudo usermod -aG docker "$USER" || true
   detect_docker_cmd
+
+  # Install Compose (try several Debian-friendly names)
+  detect_compose_cmd
+  if [[ -z "$COMPOSE" ]]; then
+    log "Installing Docker Compose (plugin not found in your repos; trying Debian packages)..."
+    # Try v2 package name (if present), then v1 docker-compose
+    if sudo apt-get install -y docker-compose-v2 2>/dev/null; then
+      :
+    elif sudo apt-get install -y docker-compose 2>/dev/null; then
+      :
+    else
+      warn "Could not install docker-compose from apt."
+      warn "Fallback: install Compose manually using Docker docs: https://docs.docker.com/compose/install/linux/"
+    fi
+  fi
+
+  detect_compose_cmd
+  if [[ -z "$COMPOSE" ]]; then
+    err "Docker Compose is still not available. Install Compose manually (see Docker docs) then re-run."
+  fi
+
+  log "Using Docker cmd: $DOCKER"
+  log "Using Compose cmd: $COMPOSE"
 }
 
-# ─────────────────────────────────────────────
-# 2. Create data directories
-# ─────────────────────────────────────────────
 create_dirs() {
   log "Creating data directories under $DATA_DIR"
   mkdir -p \
@@ -119,11 +139,7 @@ create_dirs() {
     "$DATA_DIR/laravel/app"
 }
 
-# ─────────────────────────────────────────────
-# 3. Write generated config files (only if missing)
-# ─────────────────────────────────────────────
 write_configs() {
-  # ── Mosquitto ─────────────────────────────
   local MOSQ_CONF="$SCRIPT_DIR/mosquitto/mosquitto.conf"
   local MOSQ_DEST="$DATA_DIR/mosquitto/config/mosquitto.conf"
   if [[ -f "$MOSQ_CONF" ]]; then
@@ -142,7 +158,6 @@ log_dest file /mosquitto/log/mosquitto.log
 EOF
   fi
 
-  # ── Laravel Nginx vhost ───────────────────
   local NGX_CONF="$SCRIPT_DIR/laravel/nginx.conf"
   if [[ ! -f "$NGX_CONF" ]]; then
     log "Generating default laravel/nginx.conf"
@@ -167,7 +182,6 @@ server {
 EOF
   fi
 
-  # ── Laravel Dockerfile ─────────────────────
   local LARAVEL_DF="$SCRIPT_DIR/laravel/Dockerfile"
   if [[ ! -f "$LARAVEL_DF" ]]; then
     log "Generating default laravel/Dockerfile"
@@ -182,7 +196,6 @@ WORKDIR /var/www/html
 EOF
   fi
 
-  # ── Home Assistant configuration.yaml ──────
   local HA_CONF="$DATA_DIR/homeassistant/configuration.yaml"
   if [[ ! -f "$HA_CONF" ]]; then
     log "Generating default HA configuration.yaml"
@@ -206,7 +219,6 @@ lovelace:
 EOF
   fi
 
-  # ── .env file ──────────────────────────────
   local ENV_FILE="$SCRIPT_DIR/.env"
   if [[ ! -f "$ENV_FILE" ]]; then
     log "Generating .env file"
@@ -222,11 +234,7 @@ EOF
   fi
 }
 
-# ─────────────────────────────────────────────
-# 4. Copy optional repo files if they exist
-# ─────────────────────────────────────────────
 copy_optional_files() {
-  # ── Node-RED flows ─────────────────────────
   local NR_SRC="$SCRIPT_DIR/nodered/flows.json"
   local NR_DEST="$DATA_DIR/nodered/flows.json"
   if [[ -f "$NR_SRC" ]]; then
@@ -236,14 +244,12 @@ copy_optional_files() {
     warn "nodered/flows.json not found in repo — Node-RED will start empty"
   fi
 
-  # ── Node-RED extra packages ────────────────
   local NR_PKG="$SCRIPT_DIR/nodered/package.json"
   if [[ -f "$NR_PKG" ]]; then
     log "Installing Node-RED package.json from repo"
     cp "$NR_PKG" "$DATA_DIR/nodered/package.json"
   fi
 
-  # ── HA dashboards ──────────────────────────
   local DASH_SRC="$SCRIPT_DIR/homeassistant/dashboards"
   local DASH_DEST="$DATA_DIR/homeassistant/dashboards"
   if [[ -d "$DASH_SRC" ]]; then
@@ -264,7 +270,6 @@ EOF
     fi
   fi
 
-  # ── HA secrets.yaml ────────────────────────
   local SEC_DEST="$DATA_DIR/homeassistant/secrets.yaml"
   if [[ ! -f "$SEC_DEST" ]]; then
     log "Creating empty secrets.yaml for HA"
@@ -272,65 +277,47 @@ EOF
   fi
 }
 
-# ─────────────────────────────────────────────
-# 5. Start the stack
-# ─────────────────────────────────────────────
 start_stack() {
   [[ -f "$SCRIPT_DIR/docker-compose.yml" ]] || err "docker-compose.yml not found next to setup.sh"
-
-  log "Starting Docker Compose stack..."
+  log "Starting stack..."
   cd "$SCRIPT_DIR"
-  require_compose
-  $DOCKER compose up -d
+  $COMPOSE up -d
   log "Stack started."
 }
 
-# ─────────────────────────────────────────────
-# 6. Initialize Laravel (first run only)
-# ─────────────────────────────────────────────
 init_laravel() {
   if [[ -f "$DATA_DIR/laravel/app/artisan" ]]; then
     log "Laravel already initialized, skipping."
     return
   fi
-
   log "Initializing Laravel project..."
   $DOCKER exec laravel-php bash -c "
     composer create-project laravel/laravel /tmp/laravel --prefer-dist --quiet &&
     cp -r /tmp/laravel/. /var/www/html/ &&
     chown -R www-data:www-data /var/www/html
-  " || warn "Laravel init failed (container may still be building). You can re-run setup.sh later."
+  " || warn "Laravel init failed (container may still be building). Re-run setup.sh later."
 }
 
-# ─────────────────────────────────────────────
-# 7. Install HACS
-# ─────────────────────────────────────────────
 install_hacs() {
   local HACS_MARKER="$DATA_DIR/homeassistant/custom_components/hacs"
   if [[ -d "$HACS_MARKER" ]]; then
     log "HACS already installed, skipping."
     return
   fi
-
   log "Installing HACS..."
-  # Try wget; fall back to curl (some images may have one but not the other)
   $DOCKER exec homeassistant sh -c \
     "(command -v wget >/dev/null 2>&1 && wget -qO- https://get.hacs.xyz | sh) || (command -v curl >/dev/null 2>&1 && curl -fsSL https://get.hacs.xyz | sh)" \
     || warn "HACS install failed — install manually later."
-
-  log "Restarting Home Assistant to load HACS..."
+  log "Restarting Home Assistant..."
   $DOCKER restart homeassistant || true
 }
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
 main() {
   log "=== Homestack Setup ==="
   log "Script directory: $SCRIPT_DIR"
 
-  install_docker
-  detect_docker_cmd
+  install_docker_and_compose
+
   create_dirs
   write_configs
   copy_optional_files
@@ -341,7 +328,6 @@ main() {
   echo ""
   log "=== Setup Complete ==="
 
-  # Best-effort "what IP do I browse to?"
   local HOST_IP="127.0.0.1"
   if command -v hostname &>/dev/null && hostname -I &>/dev/null; then
     HOST_IP="$(hostname -I | awk '{print $1}')"
@@ -352,11 +338,6 @@ main() {
   echo -e "  InfluxDB       : ${GREEN}http://${HOST_IP}:8086${NC}"
   echo -e "  Laravel        : ${GREEN}http://${HOST_IP}:8080${NC}"
   echo -e "  MQTT           : ${GREEN}${HOST_IP}:1883${NC}"
-  echo ""
-  warn "InfluxDB credentials are in .env — change them!"
-  warn "HACS: Go to HA → Settings → Integrations → Add → HACS to finish setup."
-  warn "Node-RED: use service names like 'mosquitto' and 'influxdb' (not 127.0.0.1)."
-  warn "From Node-RED to Home Assistant (host network): use 'host.docker.internal:8123'."
 }
 
 main "$@"
