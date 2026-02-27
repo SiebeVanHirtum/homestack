@@ -37,7 +37,11 @@ services:
       - "8086:8086"
     volumes:
       - ./data/influxdb:/var/lib/influxdb2
+      - ./influxdb/entrypoint.sh:/homestack-influx-entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/homestack-influx-entrypoint.sh"]
+    command: ["influxd"]
     environment:
+      - INFLUXD_HTTP_BIND_ADDRESS=:8086
       - DOCKER_INFLUXDB_INIT_MODE=setup
       - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_USER:-admin}
       - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_PASSWORD:-adminpassword}
