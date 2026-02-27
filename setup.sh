@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$SCRIPT_DIR/data"
 
 DOCKER="docker"
-COMPOSE=""   # will become either: "$DOCKER compose" OR "docker-compose"/"sudo docker-compose"
+COMPOSE=""
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
@@ -44,13 +44,11 @@ purge_bad_docker_apt_repo() {
   local pattern="download.docker.com/linux/ubuntu"
   local hits=()
 
-  while IFS= read -r -d '' f; do
-    hits+=("$f")
-  done < <(grep -RIlZ "$pattern" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true)
+  while IFS= read -r -d '' f; do hits+=("$f"); done < <(
+    grep -RIlZ "$pattern" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true
+  )
 
-  if ((${#hits[@]} == 0)); then
-    return
-  fi
+  ((${#hits[@]} == 0)) && return
 
   warn "Found APT entries pointing to Docker's Ubuntu repo (breaks apt on Debian trixie)."
   for f in "${hits[@]}"; do
@@ -62,27 +60,17 @@ purge_bad_docker_apt_repo() {
     sudo rm -f "$f"
   done
 
-  if [[ -f /etc/apt/keyrings/docker.gpg ]]; then
-    warn "Removing /etc/apt/keyrings/docker.gpg (cleanup)"
-    sudo rm -f /etc/apt/keyrings/docker.gpg
-  fi
+  [[ -f /etc/apt/keyrings/docker.gpg ]] && sudo rm -f /etc/apt/keyrings/docker.gpg || true
 }
 
 install_docker_and_compose() {
-  if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-  else
-    err "/etc/os-release not found; cannot detect distro"
-  fi
+  [[ -r /etc/os-release ]] || err "/etc/os-release not found; cannot detect distro"
+  # shellcheck disable=SC1091
+  . /etc/os-release
 
-  if ! command -v apt-get &>/dev/null; then
-    err "This script currently expects apt-get on your system. Install Docker/Compose manually otherwise."
-  fi
+  command -v apt-get &>/dev/null || err "This script currently expects apt-get. Install Docker/Compose manually otherwise."
 
-  if [[ "${ID:-}" == "debian" ]]; then
-    purge_bad_docker_apt_repo
-  fi
+  [[ "${ID:-}" == "debian" ]] && purge_bad_docker_apt_repo
 
   sudo apt-get update
 
@@ -99,7 +87,7 @@ install_docker_and_compose() {
 
   detect_compose_cmd
   if [[ -z "$COMPOSE" ]]; then
-    log "Installing Docker Compose (Debian-friendly packages)..."
+    log "Installing Docker Compose..."
     if sudo apt-get install -y docker-compose-v2 2>/dev/null; then
       :
     elif sudo apt-get install -y docker-compose 2>/dev/null; then
@@ -116,23 +104,6 @@ install_docker_and_compose() {
   log "Using Compose cmd: $COMPOSE"
 }
 
-ensure_host_tools() {
-  # Needed for HACS install-on-host approach + token generation fallback
-  if command -v apt-get &>/dev/null; then
-    local pkgs=()
-    command -v curl &>/dev/null || pkgs+=(curl)
-    command -v wget &>/dev/null || pkgs+=(wget)
-    command -v unzip &>/dev/null || pkgs+=(unzip)
-    command -v openssl &>/dev/null || pkgs+=(openssl)
-
-    if ((${#pkgs[@]} > 0)); then
-      log "Installing required tools: ${pkgs[*]}"
-      sudo apt-get update
-      sudo apt-get install -y "${pkgs[@]}"
-    fi
-  fi
-}
-
 create_dirs() {
   log "Creating data directories under $DATA_DIR"
   mkdir -p \
@@ -145,13 +116,11 @@ create_dirs() {
     "$DATA_DIR/laravel/app"
 }
 
-fix_nodered_permissions() {
-  # Node-RED image runs as uid/gid 1000 by default; bind mount must be writable
-  if [[ -d "$DATA_DIR/nodered" ]]; then
-    log "Fixing Node-RED data directory permissions (uid:gid 1000:1000)"
-    sudo chown -R 1000:1000 "$DATA_DIR/nodered" || true
-    sudo chmod -R u+rwX,g+rwX "$DATA_DIR/nodered" || true
-  fi
+fix_permissions() {
+  # Node-RED + InfluxDB commonly run as uid/gid 1000:1000
+  log "Fixing permissions for Node-RED and InfluxDB data dirs (uid:gid 1000:1000)"
+  sudo chown -R 1000:1000 "$DATA_DIR/nodered" "$DATA_DIR/influxdb" 2>/dev/null || true
+  sudo chmod -R u+rwX,g+rwX "$DATA_DIR/nodered" "$DATA_DIR/influxdb" 2>/dev/null || true
 }
 
 write_configs() {
@@ -260,10 +229,7 @@ copy_optional_files() {
   fi
 
   local NR_PKG="$SCRIPT_DIR/nodered/package.json"
-  if [[ -f "$NR_PKG" ]]; then
-    log "Installing Node-RED package.json from repo"
-    cp "$NR_PKG" "$DATA_DIR/nodered/package.json"
-  fi
+  [[ -f "$NR_PKG" ]] && cp "$NR_PKG" "$DATA_DIR/nodered/package.json" || true
 
   local DASH_SRC="$SCRIPT_DIR/homeassistant/dashboards"
   local DASH_DEST="$DATA_DIR/homeassistant/dashboards"
@@ -272,17 +238,15 @@ copy_optional_files() {
     mkdir -p "$DASH_DEST"
     cp -r "$DASH_SRC/." "$DASH_DEST/"
   else
-    warn "homeassistant/dashboards/ not found in repo — creating empty placeholder"
+    warn "homeassistant/dashboards/ not found in repo — creating placeholder"
     mkdir -p "$DASH_DEST"
-    if [[ ! -f "$DASH_DEST/main_dash.yaml" ]]; then
-      cat > "$DASH_DEST/main_dash.yaml" <<'EOF'
+    [[ -f "$DASH_DEST/main_dash.yaml" ]] || cat > "$DASH_DEST/main_dash.yaml" <<'EOF'
 views:
   - title: Home
     cards:
       - type: markdown
         content: "## Welcome to Homestack!\nAdd your cards here."
 EOF
-    fi
   fi
 
   local SEC_DEST="$DATA_DIR/homeassistant/secrets.yaml"
@@ -295,62 +259,23 @@ EOF
 }
 
 read_env_var() {
-  # Reads KEY from $SCRIPT_DIR/.env without sourcing arbitrary shell
   local key="$1"
   local file="$SCRIPT_DIR/.env"
   [[ -f "$file" ]] || return 1
-  awk -F= -v k="$key" 'BEGIN{found=0} $1==k{print substr($0, index($0,$2)); found=1} END{exit(found?0:1)}' "$file"
-}
-
-set_env_var() {
-  local key="$1"
-  local value="$2"
-  local file="$SCRIPT_DIR/.env"
-  [[ -f "$file" ]] || err ".env not found at $file"
-
-  if grep -qE "^${key}=" "$file"; then
-    # replace line
-    sudo sed -i "s|^${key}=.*|${key}=${value}|" "$file"
-  else
-    echo "${key}=${value}" | sudo tee -a "$file" >/dev/null
-  fi
-}
-
-ensure_influx_token() {
-  local influx_dir="$DATA_DIR/influxdb"
-  local bolt="$influx_dir/influxd.bolt"
-  local current_token
-  current_token="$(read_env_var INFLUXDB_TOKEN || echo "")"
-
-  # If influx is already initialized, do NOT change token automatically (would desync)
-  if [[ -f "$bolt" ]]; then
-    log "InfluxDB already initialized (found influxd.bolt). Keeping existing INFLUXDB_TOKEN from .env."
-    return
-  fi
-
-  # If token is missing or default, generate a new one for first-time setup
-  if [[ -z "$current_token" || "$current_token" == "changeme-token" ]]; then
-    log "Generating secure InfluxDB admin token (first-time setup)..."
-    local new_token=""
-    if command -v openssl &>/dev/null; then
-      new_token="$(openssl rand -hex 32)"
-    else
-      new_token="$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 64)"
-    fi
-    set_env_var INFLUXDB_TOKEN "$new_token"
-    log "Wrote INFLUXDB_TOKEN to .env"
-  fi
+  awk -F= -v k="$key" '$1==k{print substr($0, index($0,$2)); exit 0} END{exit 1}' "$file"
 }
 
 ensure_ha_influxdb_config() {
   local ha_conf="$DATA_DIR/homeassistant/configuration.yaml"
   local sec="$DATA_DIR/homeassistant/secrets.yaml"
 
-  [[ -f "$ha_conf" ]] || err "HA configuration.yaml not found at $ha_conf"
-  [[ -f "$sec" ]] || err "HA secrets.yaml not found at $sec"
+  local tok org bucket
+  tok="$(read_env_var INFLUXDB_TOKEN || echo "")"
+  org="$(read_env_var INFLUXDB_ORG || echo "homestack")"
+  bucket="$(read_env_var INFLUXDB_BUCKET || echo "home")"
 
   if ! grep -qE '^[[:space:]]*influxdb:' "$ha_conf"; then
-    log "Adding InfluxDB v2 integration block to Home Assistant configuration.yaml"
+    log "Adding InfluxDB v2 integration to Home Assistant configuration.yaml"
     cat >> "$ha_conf" <<'EOF'
 
 influxdb:
@@ -363,25 +288,21 @@ influxdb:
   bucket: !secret influxdb_bucket
 EOF
   else
-    log "Home Assistant configuration.yaml already contains an influxdb: block (leaving as-is)."
+    log "configuration.yaml already has influxdb: block (leaving as-is)."
   fi
 
-  # Secrets: only append if missing (don’t overwrite user edits)
-  local tok org bucket
-  tok="$(read_env_var INFLUXDB_TOKEN || echo "")"
-  org="$(read_env_var INFLUXDB_ORG || echo "homestack")"
-  bucket="$(read_env_var INFLUXDB_BUCKET || echo "home")"
-
-  if ! grep -qE '^[[:space:]]*influxdb_token:' "$sec"; then
-    log "Adding influxdb_token to secrets.yaml"
+  # If secrets are missing OR still placeholders, set them to match .env
+  if ! grep -qE '^[[:space:]]*influxdb_token:' "$sec" || grep -qE '^[[:space:]]*influxdb_token:[[:space:]]*("?changeme-token"?)' "$sec"; then
+    log "Setting influxdb_token in secrets.yaml from .env"
+    # remove any existing influxdb_token line, then append correct one
+    sed -i '/^[[:space:]]*influxdb_token:/d' "$sec" || true
     echo "influxdb_token: \"${tok}\"" >> "$sec"
   fi
+
   if ! grep -qE '^[[:space:]]*influxdb_org:' "$sec"; then
-    log "Adding influxdb_org to secrets.yaml"
     echo "influxdb_org: \"${org}\"" >> "$sec"
   fi
   if ! grep -qE '^[[:space:]]*influxdb_bucket:' "$sec"; then
-    log "Adding influxdb_bucket to secrets.yaml"
     echo "influxdb_bucket: \"${bucket}\"" >> "$sec"
   fi
 }
@@ -407,28 +328,9 @@ init_laravel() {
   " || warn "Laravel init failed (container may still be building). Re-run setup.sh later."
 }
 
-install_hacs() {
-  local marker="$DATA_DIR/homeassistant/custom_components/hacs"
-  if [[ -d "$marker" ]]; then
-    log "HACS already installed, skipping."
-    return
-  fi
-
-  log "Installing HACS into $DATA_DIR/homeassistant (host-side, bash-safe)..."
-  ensure_host_tools
-
-  # Run the official installer *from within the HA config directory*
-  (
-    cd "$DATA_DIR/homeassistant"
-    if command -v curl &>/dev/null; then
-      curl -fsSL https://get.hacs.xyz | bash -
-    else
-      wget -qO- https://get.hacs.xyz | bash -
-    fi
-  ) || warn "HACS install failed (will need manual install)."
-
-  log "Restarting Home Assistant..."
-  $DOCKER restart homeassistant || true
+restart_homeassistant() {
+  log "Restarting Home Assistant to apply config changes..."
+  $DOCKER restart homeassistant >/dev/null 2>&1 || true
 }
 
 main() {
@@ -440,19 +342,12 @@ main() {
   create_dirs
   write_configs
   copy_optional_files
-
-  # Fix Node-RED permissions BEFORE starting containers (prevents EACCES crash)
-  fix_nodered_permissions
-
-  # Make Influx token sane BEFORE starting Influx for the first time
-  ensure_influx_token
-
-  # Ensure HA is configured to write to InfluxDB v2
+  fix_permissions
   ensure_ha_influxdb_config
 
   start_stack
   init_laravel
-  install_hacs
+  restart_homeassistant
 
   echo ""
   log "=== Setup Complete ==="
@@ -467,11 +362,6 @@ main() {
   echo -e "  InfluxDB       : ${GREEN}http://${HOST_IP}:8086${NC}"
   echo -e "  Laravel        : ${GREEN}http://${HOST_IP}:8080${NC}"
   echo -e "  MQTT           : ${GREEN}${HOST_IP}:1883${NC}"
-
-  echo ""
-  log "InfluxDB token is stored in: $SCRIPT_DIR/.env"
-  log "Home Assistant reads it from: $DATA_DIR/homeassistant/secrets.yaml"
-  warn "HACS still requires ONE UI step: Settings → Devices & services → Add integration → HACS"
 }
 
 main "$@"
