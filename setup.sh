@@ -398,6 +398,11 @@ influxdb:
   token: !secret influxdb_token
   organization: !secret influxdb_org
   bucket: !secret influxdb_bucket
+  tags:
+    source: HA
+  tags_attributes:
+    - friendly_name
+  default_measurement: units
 EOF
 )"
   else
