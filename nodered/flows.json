@@ -1,0 +1,302 @@
+[
+    {
+        "id": "f6f2187d.f17ca8",
+        "type": "tab",
+        "label": "Flow 1",
+        "disabled": false,
+        "info": ""
+    },
+    {
+        "id": "8a2a0c24628155e9",
+        "type": "junction",
+        "z": "f6f2187d.f17ca8",
+        "x": 590,
+        "y": 240,
+        "wires": [
+            [
+                "ed039145310c3a30"
+            ]
+        ]
+    },
+    {
+        "id": "ed039145310c3a30",
+        "type": "junction",
+        "z": "f6f2187d.f17ca8",
+        "x": 1330,
+        "y": 240,
+        "wires": [
+            [
+                "7660fe5129ecd669"
+            ]
+        ]
+    },
+    {
+        "id": "dc077abf5376b472",
+        "type": "function",
+        "z": "f6f2187d.f17ca8",
+        "name": "config_backup",
+        "func": "msg.config_backup = {\n    user: msg.payload.user_input,\n    device: msg.payload.device_config\n};\n\n// Check of er een IP-adres is ingevuld\nif (msg.payload.user_input.device_ip && msg.payload.user_input.device_ip.trim() !== \"\") {\n    node.status({fill:\"blue\", shape:\"dot\", text:\"IP gevonden: Start hardware config\"});\n    return [msg, null]; // Stuur naar uitgang 1\n} else {\n    node.status({fill:\"green\", shape:\"dot\", text:\"Geen IP: Direct naar Discovery\"});\n    return [null, msg]; // Stuur naar uitgang 2\n}\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 380,
+        "y": 180,
+        "wires": [
+            [
+                "8c760c44aaf6c1a6"
+            ],
+            [
+                "8a2a0c24628155e9"
+            ]
+        ]
+    },
+    {
+        "id": "a6289038f115287e",
+        "type": "http request",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "method": "use",
+        "ret": "obj",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [
+            {
+                "keyType": "other",
+                "keyValue": "Content-Type",
+                "valueType": "other",
+                "valueValue": "application/json"
+            }
+        ],
+        "x": 790,
+        "y": 180,
+        "wires": [
+            [
+                "8d3181cd12f9aa19"
+            ]
+        ]
+    },
+    {
+        "id": "7660fe5129ecd669",
+        "type": "function",
+        "z": "f6f2187d.f17ca8",
+        "name": "Universele Discovery",
+        "func": "const user = msg.config_backup.user;\nconst deviceDef = msg.config_backup.device;\nlet messages = [];\n\ndeviceDef.entities.forEach(entity => {\n    // 1. Naamgeving verbeteren (Spatie toevoegen indien sensor)\n    let displayName = user.friendly_name;\n    if (entity.id !== 'switch') {\n        displayName += \" \" + (entity.config.name || entity.id.charAt(0).toUpperCase() + entity.id.slice(1));\n    }\n\n    let discoveryPayload = {\n        \"name\": displayName,\n        \"unique_id\": user.device_id + entity.suffix,\n        \"device\": {\n            \"identifiers\": [user.device_id],\n            \"name\": user.friendly_name,\n            \"model\": deviceDef.device_info.model,\n            \"manufacturer\": deviceDef.device_info.manufacturer\n        }\n    };\n\n    // 2. Velden uit JSON config overnemen\n    Object.assign(discoveryPayload, entity.config);\n\n    // 3. Forceer volledige MQTT topics (Device ID + Relatief pad)\n    discoveryPayload.state_topic = user.device_id + entity.config.state_topic;\n\n    if (entity.config.command_topic) {\n        discoveryPayload.command_topic = user.device_id + entity.config.command_topic;\n    }\n\n    // 4. Bericht toevoegen aan lijst\n    messages.push({\n        topic: `homeassistant/${entity.type}/${user.device_id}${entity.suffix}/config`,\n        payload: discoveryPayload,\n        retain: true\n    });\n});\n\n// Stuur berichten naar MQTT (uitgang 1) en stuur 'OK' naar PHP (uitgang 2)\nreturn [messages, { payload: \"Apparaat succesvol verwerkt\", res: msg.res }];\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1460,
+        "y": 180,
+        "wires": [
+            [
+                "c3901cb41f46df23"
+            ]
+        ]
+    },
+    {
+        "id": "c3901cb41f46df23",
+        "type": "mqtt out",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "topic": "",
+        "qos": "",
+        "retain": "true",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "13f7a29328fc8e4e",
+        "x": 1650,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "8c760c44aaf6c1a6",
+        "type": "function",
+        "z": "f6f2187d.f17ca8",
+        "name": "Prepare HTTP",
+        "func": "const config = msg.config_backup;\n\n// 1. Veiligheidscheck: bestaat de setup sectie wel?\nif (!config || !config.device || !config.device.setup || !config.device.setup.endpoint) {\n    node.warn(\"Dit apparaat heeft geen HTTP setup nodig.\");\n    return null; \n}\n\nconst user = config.user;\nconst setup = config.device.setup;\n\n// 2. Kopieer de payload_structure (deep copy)\nlet finalPayload = JSON.parse(JSON.stringify(setup.payload_structure));\n\n// 3. Vervang placeholders\nif (finalPayload.config) {\n    finalPayload.config.enable = true;\n    finalPayload.config.server = user.mqtt_server;\n    finalPayload.config.user = user.mqtt_user;\n    finalPayload.config.pass = user.mqtt_pass;\n    finalPayload.config.topic_prefix = user.device_id;\n    \n    // Specifiek voor Shelly Gen2 status updates\n    finalPayload.config.rpc_en = true;       \n    finalPayload.config.status_update = true; \n}\n\n// 4. Bereid de HTTP Request parameters voor\nmsg.method = \"POST\";\nmsg.url = \"http://\" + user.device_ip + setup.endpoint;\nmsg.headers = {\n    \"Content-Type\": \"application/json\"\n};\nmsg.payload = finalPayload;\n\nnode.status({fill:\"blue\", shape:\"dot\", text:\"Config naar \" + user.device_ip});\n\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 600,
+        "y": 180,
+        "wires": [
+            [
+                "a6289038f115287e"
+            ]
+        ]
+    },
+    {
+        "id": "ad06c714891d7519",
+        "type": "http in",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "url": "/add-device",
+        "method": "post",
+        "upload": false,
+        "skipBodyParsing": false,
+        "swaggerDoc": "",
+        "x": 150,
+        "y": 180,
+        "wires": [
+            [
+                "dc077abf5376b472",
+                "57be38fcf0a97e52"
+            ]
+        ]
+    },
+    {
+        "id": "57bbd1f9e74bb862",
+        "type": "http response",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "statusCode": "",
+        "headers": {},
+        "x": 1650,
+        "y": 120,
+        "wires": []
+    },
+    {
+        "id": "57be38fcf0a97e52",
+        "type": "change",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "rules": [
+            {
+                "t": "set",
+                "p": "payload",
+                "pt": "msg",
+                "to": "Apparaat wordt toegevoegd...",
+                "tot": "str"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 370,
+        "y": 120,
+        "wires": [
+            [
+                "57bbd1f9e74bb862"
+            ]
+        ]
+    },
+    {
+        "id": "bfb93e776c88d5d3",
+        "type": "http request",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "method": "use",
+        "ret": "obj",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 1130,
+        "y": 180,
+        "wires": [
+            [
+                "556ac0d5127f397b"
+            ]
+        ]
+    },
+    {
+        "id": "8d3181cd12f9aa19",
+        "type": "function",
+        "z": "f6f2187d.f17ca8",
+        "name": "Prepare Reboot",
+        "func": "const config = msg.config_backup;\n\n// Check of er een reboot endpoint is gedefinieerd voor dit device\nif (config.device.setup && config.device.setup.reboot_endpoint) {\n    msg.url = \"http://\" + config.user.device_ip + config.device.setup.reboot_endpoint;\n    msg.method = \"POST\";\n    msg.payload = {};\n    return msg;\n}\n\n// Als er geen reboot nodig is, stuur het bericht direct door naar de volgende stap\nreturn null; \n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 960,
+        "y": 180,
+        "wires": [
+            [
+                "bfb93e776c88d5d3"
+            ]
+        ]
+    },
+    {
+        "id": "556ac0d5127f397b",
+        "type": "delay",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "pauseType": "delay",
+        "timeout": "2",
+        "timeoutUnits": "seconds",
+        "rate": "1",
+        "nbRateUnits": "1",
+        "rateUnits": "second",
+        "randomFirst": "1",
+        "randomLast": "5",
+        "randomUnits": "seconds",
+        "drop": false,
+        "allowrate": false,
+        "outputs": 1,
+        "x": 1280,
+        "y": 180,
+        "wires": [
+            [
+                "7660fe5129ecd669"
+            ]
+        ]
+    },
+    {
+        "id": "13f7a29328fc8e4e",
+        "type": "mqtt-broker",
+        "name": "mqtt-pi",
+        "broker": "10.3.141.1",
+        "port": 1883,
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    }
+]
