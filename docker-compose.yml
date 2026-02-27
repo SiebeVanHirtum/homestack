@@ -14,6 +14,7 @@ services:
   nodered:
     image: nodered/node-red:latest
     container_name: nodered
+    hostname: nodered
     restart: unless-stopped
     ports:
       - "1880:1880"
@@ -23,6 +24,7 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - TZ=${TZ:-Europe/Brussels}
+      - FLOWS=flows.json
     depends_on:
       - mosquitto
       - influxdb
