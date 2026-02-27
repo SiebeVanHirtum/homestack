@@ -104,16 +104,60 @@ install_docker_and_compose() {
   log "Using Compose cmd: $COMPOSE"
 }
 
+# Write helpers that work even if the user previously ran setup with sudo (root-owned files)
+file_is_writable() { [[ -e "$1" && -w "$1" ]]; }
+
+write_file() {
+  local path="$1"
+  local content="$2"
+  if [[ -e "$path" ]] && ! file_is_writable "$path"; then
+    printf "%s" "$content" | sudo tee "$path" >/dev/null
+  else
+    printf "%s" "$content" > "$path"
+  fi
+}
+
+append_file() {
+  local path="$1"
+  local content="$2"
+  if [[ -e "$path" ]] && ! file_is_writable "$path"; then
+    printf "%s" "$content" | sudo tee -a "$path" >/dev/null
+  else
+    printf "%s" "$content" >> "$path"
+  fi
+}
+
+sed_inplace_delete() {
+  local path="$1"
+  local expr="$2"
+  if [[ -e "$path" ]] && ! file_is_writable "$path"; then
+    sudo sed -i "$expr" "$path" || true
+  else
+    sed -i "$expr" "$path" || true
+  fi
+}
+
 create_dirs() {
   log "Creating data directories under $DATA_DIR"
+
+  # sanity: if a path exists but is not a directory, fail early
+  [[ -e "$DATA_DIR" && ! -d "$DATA_DIR" ]] && err "$DATA_DIR exists but is not a directory"
+
   mkdir -p \
     "$DATA_DIR/homeassistant" \
+    "$DATA_DIR/homeassistant/.storage" \
     "$DATA_DIR/nodered" \
     "$DATA_DIR/influxdb" \
     "$DATA_DIR/mosquitto/config" \
     "$DATA_DIR/mosquitto/data" \
     "$DATA_DIR/mosquitto/log" \
-    "$DATA_DIR/laravel/app"
+    "$DATA_DIR/laravel/app" \
+    "$SCRIPT_DIR/influxdb" \
+    "$SCRIPT_DIR/laravel" \
+    "$SCRIPT_DIR/mosquitto"
+
+  # Ensure HA config mount target is truly a directory
+  [[ -d "$DATA_DIR/homeassistant" ]] || err "$DATA_DIR/homeassistant is not a directory"
 }
 
 fix_permissions() {
@@ -121,6 +165,10 @@ fix_permissions() {
   log "Fixing permissions for Node-RED and InfluxDB data dirs (uid:gid 1000:1000)"
   sudo chown -R 1000:1000 "$DATA_DIR/nodered" "$DATA_DIR/influxdb" 2>/dev/null || true
   sudo chmod -R u+rwX,g+rwX "$DATA_DIR/nodered" "$DATA_DIR/influxdb" 2>/dev/null || true
+
+  # Home Assistant needs to be able to create /config/.storage
+  mkdir -p "$DATA_DIR/homeassistant/.storage" || true
+  sudo chmod -R a+rwX "$DATA_DIR/homeassistant" 2>/dev/null || true
 }
 
 write_configs() {
@@ -131,7 +179,7 @@ write_configs() {
     cp "$MOSQ_CONF" "$MOSQ_DEST"
   elif [[ ! -f "$MOSQ_DEST" ]]; then
     log "Generating default mosquitto.conf"
-    cat > "$MOSQ_DEST" <<'EOF'
+    write_file "$MOSQ_DEST" "$(cat <<'EOF'
 listener 1883
 listener 9001
 protocol websockets
@@ -140,13 +188,13 @@ persistence true
 persistence_location /mosquitto/data/
 log_dest file /mosquitto/log/mosquitto.log
 EOF
+)"
   fi
 
   local NGX_CONF="$SCRIPT_DIR/laravel/nginx.conf"
   if [[ ! -f "$NGX_CONF" ]]; then
     log "Generating default laravel/nginx.conf"
-    mkdir -p "$SCRIPT_DIR/laravel"
-    cat > "$NGX_CONF" <<'EOF'
+    write_file "$NGX_CONF" "$(cat <<'EOF'
 server {
     listen 80;
     root /var/www/html/public;
@@ -164,13 +212,13 @@ server {
     }
 }
 EOF
+)"
   fi
 
   local LARAVEL_DF="$SCRIPT_DIR/laravel/Dockerfile"
   if [[ ! -f "$LARAVEL_DF" ]]; then
     log "Generating default laravel/Dockerfile"
-    mkdir -p "$SCRIPT_DIR/laravel"
-    cat > "$LARAVEL_DF" <<'EOF'
+    write_file "$LARAVEL_DF" "$(cat <<'EOF'
 FROM php:8.2-fpm
 RUN apt-get update && apt-get install -y \
     git curl zip unzip libpng-dev libonig-dev libxml2-dev \
@@ -178,12 +226,36 @@ RUN apt-get update && apt-get install -y \
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 WORKDIR /var/www/html
 EOF
+)"
+  fi
+
+  # InfluxDB init-loop fix (entrypoint wrapper)
+  local INFLUX_EP="$SCRIPT_DIR/influxdb/entrypoint.sh"
+  if [[ ! -f "$INFLUX_EP" ]]; then
+    log "Generating influxdb/entrypoint.sh (prevents Influx init loop)"
+    write_file "$INFLUX_EP" "$(cat <<'EOF'
+#!/bin/sh
+set -eu
+
+# InfluxDB docker init uses a CLI config name "default".
+# If the container restarts mid-init, that config may already exist and init loops forever.
+# Clearing it makes the init process idempotent and allows setup to complete.
+rm -f /root/.influxdbv2/configs 2>/dev/null || true
+rm -rf /root/.influxdbv2 2>/dev/null || true
+
+if [ "$#" -eq 0 ]; then
+  set -- influxd
+fi
+
+exec /entrypoint.sh "$@"
+EOF
+)"
   fi
 
   local HA_CONF="$DATA_DIR/homeassistant/configuration.yaml"
   if [[ ! -f "$HA_CONF" ]]; then
     log "Generating default HA configuration.yaml"
-    cat > "$HA_CONF" <<'EOF'
+    write_file "$HA_CONF" "$(cat <<'EOF'
 homeassistant:
   name: Home
   unit_system: metric
@@ -201,12 +273,13 @@ lovelace:
       icon: mdi:home
       show_in_sidebar: true
 EOF
+)"
   fi
 
   local ENV_FILE="$SCRIPT_DIR/.env"
   if [[ ! -f "$ENV_FILE" ]]; then
     log "Generating .env file"
-    cat > "$ENV_FILE" <<EOF
+    write_file "$ENV_FILE" "$(cat <<'EOF'
 TZ=Europe/Brussels
 INFLUXDB_USER=admin
 INFLUXDB_PASSWORD=adminpassword
@@ -214,6 +287,7 @@ INFLUXDB_ORG=homestack
 INFLUXDB_BUCKET=home
 INFLUXDB_TOKEN=changeme-token
 EOF
+)"
     warn "Default credentials written to .env — change them before exposing to the internet!"
   fi
 }
@@ -240,21 +314,25 @@ copy_optional_files() {
   else
     warn "homeassistant/dashboards/ not found in repo — creating placeholder"
     mkdir -p "$DASH_DEST"
-    [[ -f "$DASH_DEST/main_dash.yaml" ]] || cat > "$DASH_DEST/main_dash.yaml" <<'EOF'
+    if [[ ! -f "$DASH_DEST/main_dash.yaml" ]]; then
+      write_file "$DASH_DEST/main_dash.yaml" "$(cat <<'EOF'
 views:
   - title: Home
     cards:
       - type: markdown
         content: "## Welcome to Homestack!\nAdd your cards here."
 EOF
+)"
+    fi
   fi
 
   local SEC_DEST="$DATA_DIR/homeassistant/secrets.yaml"
   if [[ ! -f "$SEC_DEST" ]]; then
     log "Creating secrets.yaml for HA"
-    cat > "$SEC_DEST" <<'EOF'
+    write_file "$SEC_DEST" "$(cat <<'EOF'
 # Add your secrets here
 EOF
+)"
   fi
 }
 
@@ -263,6 +341,40 @@ read_env_var() {
   local file="$SCRIPT_DIR/.env"
   [[ -f "$file" ]] || return 1
   awk -F= -v k="$key" '$1==k{print substr($0, index($0,$2)); exit 0} END{exit 1}' "$file"
+}
+
+ensure_influx_token() {
+  # Only generate token on FIRST init (when influxd.bolt doesn't exist yet)
+  local bolt="$DATA_DIR/influxdb/influxd.bolt"
+  local env_file="$SCRIPT_DIR/.env"
+  local tok
+  tok="$(read_env_var INFLUXDB_TOKEN || echo "")"
+
+  if [[ -f "$bolt" ]]; then
+    log "InfluxDB already initialized (found influxd.bolt). Keeping existing INFLUXDB_TOKEN."
+    return
+  fi
+
+  if [[ -z "$tok" || "$tok" == "changeme-token" ]]; then
+    log "Generating secure InfluxDB token for first-time setup..."
+    local new_token=""
+    if command -v openssl &>/dev/null; then
+      new_token="$(openssl rand -hex 32)"
+    else
+      new_token="$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 64)"
+    fi
+
+    # update/append in .env without sourcing it
+    if grep -qE '^INFLUXDB_TOKEN=' "$env_file"; then
+      if file_is_writable "$env_file"; then
+        sed -i "s|^INFLUXDB_TOKEN=.*|INFLUXDB_TOKEN=${new_token}|" "$env_file"
+      else
+        sudo sed -i "s|^INFLUXDB_TOKEN=.*|INFLUXDB_TOKEN=${new_token}|" "$env_file"
+      fi
+    else
+      append_file "$env_file" $'\n'"INFLUXDB_TOKEN=${new_token}"$'\n'
+    fi
+  fi
 }
 
 ensure_ha_influxdb_config() {
@@ -276,7 +388,7 @@ ensure_ha_influxdb_config() {
 
   if ! grep -qE '^[[:space:]]*influxdb:' "$ha_conf"; then
     log "Adding InfluxDB v2 integration to Home Assistant configuration.yaml"
-    cat >> "$ha_conf" <<'EOF'
+    append_file "$ha_conf" "$(cat <<'EOF'
 
 influxdb:
   api_version: 2
@@ -287,6 +399,7 @@ influxdb:
   organization: !secret influxdb_org
   bucket: !secret influxdb_bucket
 EOF
+)"
   else
     log "configuration.yaml already has influxdb: block (leaving as-is)."
   fi
@@ -294,16 +407,15 @@ EOF
   # If secrets are missing OR still placeholders, set them to match .env
   if ! grep -qE '^[[:space:]]*influxdb_token:' "$sec" || grep -qE '^[[:space:]]*influxdb_token:[[:space:]]*("?changeme-token"?)' "$sec"; then
     log "Setting influxdb_token in secrets.yaml from .env"
-    # remove any existing influxdb_token line, then append correct one
-    sed -i '/^[[:space:]]*influxdb_token:/d' "$sec" || true
-    echo "influxdb_token: \"${tok}\"" >> "$sec"
+    sed_inplace_delete "$sec" '/^[[:space:]]*influxdb_token:/d'
+    append_file "$sec" "influxdb_token: \"${tok}\""$'\n'
   fi
 
   if ! grep -qE '^[[:space:]]*influxdb_org:' "$sec"; then
-    echo "influxdb_org: \"${org}\"" >> "$sec"
+    append_file "$sec" "influxdb_org: \"${org}\""$'\n'
   fi
   if ! grep -qE '^[[:space:]]*influxdb_bucket:' "$sec"; then
-    echo "influxdb_bucket: \"${bucket}\"" >> "$sec"
+    append_file "$sec" "influxdb_bucket: \"${bucket}\""$'\n'
   fi
 }
 
@@ -311,7 +423,13 @@ start_stack() {
   [[ -f "$SCRIPT_DIR/docker-compose.yml" ]] || err "docker-compose.yml not found next to setup.sh"
   log "Starting stack..."
   cd "$SCRIPT_DIR"
+
+  # Important: recreate InfluxDB to apply entrypoint wrapper (fixes init loop)
+  $COMPOSE up -d --remove-orphans --force-recreate influxdb
+
+  # Then bring up everything else
   $COMPOSE up -d --remove-orphans
+
   log "Stack started."
 }
 
@@ -343,6 +461,8 @@ main() {
   write_configs
   copy_optional_files
   fix_permissions
+
+  ensure_influx_token
   ensure_ha_influxdb_config
 
   start_stack
