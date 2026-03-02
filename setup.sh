@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$SCRIPT_DIR/data"
 
-# Laravel repo to install into ./data/laravel/app
-LARAVEL_REPO_URL="https://github.com/SiebeVanHirtum/HA-Configurator"
-LARAVEL_REPO_BRANCH="main"
+# Plain PHP repo to install into ./data/php/app
+PHP_REPO_URL="https://github.com/SiebeVanHirtum/HA-Configurator"
+PHP_REPO_BRANCH="main"
 
 DOCKER="docker"
 COMPOSE=""
@@ -108,7 +108,6 @@ install_docker_and_compose() {
   log "Using Compose cmd: $COMPOSE"
 }
 
-# Write helpers that work even if the user previously ran setup with sudo (root-owned files)
 file_is_writable() { [[ -e "$1" && -w "$1" ]]; }
 
 write_file() {
@@ -144,7 +143,6 @@ sed_inplace_delete() {
 create_dirs() {
   log "Creating data directories under $DATA_DIR"
 
-  # sanity: if a path exists but is not a directory, fail early
   [[ -e "$DATA_DIR" && ! -d "$DATA_DIR" ]] && err "$DATA_DIR exists but is not a directory"
 
   mkdir -p \
@@ -155,24 +153,53 @@ create_dirs() {
     "$DATA_DIR/mosquitto/config" \
     "$DATA_DIR/mosquitto/data" \
     "$DATA_DIR/mosquitto/log" \
-    "$DATA_DIR/laravel/app" \
+    "$DATA_DIR/php/app" \
     "$SCRIPT_DIR/influxdb" \
-    "$SCRIPT_DIR/laravel" \
-    "$SCRIPT_DIR/mosquitto"
+    "$SCRIPT_DIR/mosquitto" \
+    "$SCRIPT_DIR/php"
 
-  # Ensure HA config mount target is truly a directory
   [[ -d "$DATA_DIR/homeassistant" ]] || err "$DATA_DIR/homeassistant is not a directory"
 }
 
 fix_permissions() {
-  # Node-RED + InfluxDB commonly run as uid/gid 1000:1000
   log "Fixing permissions for Node-RED and InfluxDB data dirs (uid:gid 1000:1000)"
   sudo chown -R 1000:1000 "$DATA_DIR/nodered" "$DATA_DIR/influxdb" 2>/dev/null || true
   sudo chmod -R u+rwX,g+rwX "$DATA_DIR/nodered" "$DATA_DIR/influxdb" 2>/dev/null || true
 
-  # Home Assistant needs to be able to create /config/.storage
   mkdir -p "$DATA_DIR/homeassistant/.storage" || true
   sudo chmod -R a+rwX "$DATA_DIR/homeassistant" 2>/dev/null || true
+
+  # PHP app directory should be writable by container user (www-data)
+  sudo chmod -R a+rwX "$DATA_DIR/php/app" 2>/dev/null || true
+}
+
+write_php_nginx_conf() {
+  # $1 = docroot inside /var/www/html ("" or "public")
+  local sub="${1:-}"
+  local root="/var/www/html"
+  [[ -n "$sub" ]] && root="/var/www/html/$sub"
+
+  write_file "$SCRIPT_DIR/php/nginx.conf" "$(cat <<EOF
+server {
+    listen 80;
+    server_name _;
+
+    root $root;
+    index index.php index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass php-fpm:9000;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+}
+EOF
+)"
 }
 
 write_configs() {
@@ -195,44 +222,6 @@ EOF
 )"
   fi
 
-  local NGX_CONF="$SCRIPT_DIR/laravel/nginx.conf"
-  if [[ ! -f "$NGX_CONF" ]]; then
-    log "Generating default laravel/nginx.conf"
-    write_file "$NGX_CONF" "$(cat <<'EOF'
-server {
-    listen 80;
-    root /var/www/html/public;
-    index index.php index.html;
-
-    location / {
-        try_files $uri $uri/ /index.php?$query_string;
-    }
-
-    location ~ \.php$ {
-        fastcgi_pass laravel-php:9000;
-        fastcgi_index index.php;
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-    }
-}
-EOF
-)"
-  fi
-
-  local LARAVEL_DF="$SCRIPT_DIR/laravel/Dockerfile"
-  if [[ ! -f "$LARAVEL_DF" ]]; then
-    log "Generating default laravel/Dockerfile"
-    write_file "$LARAVEL_DF" "$(cat <<'EOF'
-FROM php:8.2-fpm
-RUN apt-get update && apt-get install -y \
-    git curl zip unzip libpng-dev libonig-dev libxml2-dev \
-    && docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd
-COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
-WORKDIR /var/www/html
-EOF
-)"
-  fi
-
   # InfluxDB init-loop fix (entrypoint wrapper)
   local INFLUX_EP="$SCRIPT_DIR/influxdb/entrypoint.sh"
   if [[ ! -f "$INFLUX_EP" ]]; then
@@ -240,20 +229,39 @@ EOF
     write_file "$INFLUX_EP" "$(cat <<'EOF'
 #!/bin/sh
 set -eu
-
-# InfluxDB docker init uses a CLI config name "default".
-# If the container restarts mid-init, that config may already exist and init loops forever.
-# Clearing it makes the init process idempotent and allows setup to complete.
 rm -f /root/.influxdbv2/configs 2>/dev/null || true
 rm -rf /root/.influxdbv2 2>/dev/null || true
-
 if [ "$#" -eq 0 ]; then
   set -- influxd
 fi
-
 exec /entrypoint.sh "$@"
 EOF
 )"
+  fi
+
+  # PHP-FPM image
+  local PHP_DF="$SCRIPT_DIR/php/Dockerfile"
+  if [[ ! -f "$PHP_DF" ]]; then
+    log "Generating php/Dockerfile"
+    write_file "$PHP_DF" "$(cat <<'EOF'
+FROM php:8.2-fpm
+
+RUN apt-get update && apt-get install -y \
+    git unzip \
+  && rm -rf /var/lib/apt/lists/*
+
+# Optional: composer (useful if repo has composer.json, even if you say "no framework")
+COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+
+WORKDIR /var/www/html
+EOF
+)"
+  fi
+
+  # Default nginx conf (will be adjusted after cloning repo)
+  if [[ ! -f "$SCRIPT_DIR/php/nginx.conf" ]]; then
+    log "Generating default php/nginx.conf"
+    write_php_nginx_conf ""
   fi
 
   local HA_CONF="$DATA_DIR/homeassistant/configuration.yaml"
@@ -348,7 +356,6 @@ read_env_var() {
 }
 
 ensure_influx_token() {
-  # Only generate token on FIRST init (when influxd.bolt doesn't exist yet)
   local bolt="$DATA_DIR/influxdb/influxd.bolt"
   local env_file="$SCRIPT_DIR/.env"
   local tok
@@ -368,7 +375,6 @@ ensure_influx_token() {
       new_token="$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 64)"
     fi
 
-    # update/append in .env without sourcing it
     if grep -qE '^INFLUXDB_TOKEN=' "$env_file"; then
       if file_is_writable "$env_file"; then
         sed -i "s|^INFLUXDB_TOKEN=.*|INFLUXDB_TOKEN=${new_token}|" "$env_file"
@@ -413,7 +419,6 @@ EOF
     log "configuration.yaml already has influxdb: block (leaving as-is)."
   fi
 
-  # If secrets are missing OR still placeholders, set them to match .env
   if ! grep -qE '^[[:space:]]*influxdb_token:' "$sec" || grep -qE '^[[:space:]]*influxdb_token:[[:space:]]*("?changeme-token"?)' "$sec"; then
     log "Setting influxdb_token in secrets.yaml from .env"
     sed_inplace_delete "$sec" '/^[[:space:]]*influxdb_token:/d'
@@ -433,75 +438,85 @@ start_stack() {
   log "Starting stack..."
   cd "$SCRIPT_DIR"
 
-  # Important: recreate InfluxDB to apply entrypoint wrapper (fixes init loop)
   $COMPOSE up -d --remove-orphans --force-recreate influxdb
-
-  # Then bring up everything else
   $COMPOSE up -d --remove-orphans
 
   log "Stack started."
 }
 
-install_laravel_from_github() {
-  # Install a Laravel project from GitHub into the bind-mounted volume (/var/www/html)
-  # This replaces composer create-project.
-  local marker="$DATA_DIR/laravel/app/artisan"
+wait_for_container_running() {
+  local name="$1"
+  local timeout="${2:-180}"
+  local start_ts now_ts
 
-  if [[ -f "$marker" ]]; then
-    log "Laravel already present ($marker exists), skipping GitHub install."
+  start_ts="$(date +%s)"
+  while true; do
+    if $DOCKER inspect -f '{{.State.Running}}' "$name" >/dev/null 2>&1; then
+      local running
+      running="$($DOCKER inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo "false")"
+      if [[ "$running" == "true" ]]; then
+        return 0
+      fi
+    fi
+
+    now_ts="$(date +%s)"
+    if (( now_ts - start_ts > timeout )); then
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+install_php_site_from_github() {
+  local app_dir="$DATA_DIR/php/app"
+
+  log "Installing PHP site from GitHub: $PHP_REPO_URL (branch: $PHP_REPO_BRANCH)"
+
+  if ! wait_for_container_running "php-fpm" 240; then
+    warn "php-fpm is not running yet; skipping GitHub clone. Re-run setup.sh once php-fpm is up."
     return
   fi
 
-  log "Installing Laravel project from GitHub: $LARAVEL_REPO_URL (branch: $LARAVEL_REPO_BRANCH)"
+  # Determine if already installed
+  if [[ -f "$app_dir/index.php" || -f "$app_dir/public/index.php" || -f "$app_dir/index.html" || -f "$app_dir/public/index.html" ]]; then
+    log "PHP site already present in $app_dir (skipping clone)."
+  else
+    if [[ -n "$(ls -A "$app_dir" 2>/dev/null || true)" ]]; then
+      warn "$app_dir is not empty but no index file found. Not overwriting."
+      warn "Empty $app_dir if you want the repo to be cloned fresh."
+      return
+    fi
 
-  # If directory isn't empty (e.g. leftover files), don't clobber silently.
-  if [[ -n "$(ls -A "$DATA_DIR/laravel/app" 2>/dev/null || true)" ]]; then
-    warn "$DATA_DIR/laravel/app is not empty, but artisan not found. Not overwriting."
-    warn "If you want a clean install, empty that directory and re-run setup.sh"
-    return
+    $DOCKER exec php-fpm bash -lc "
+      set -euo pipefail
+      rm -rf /tmp/php_site_install
+      git clone --depth 1 --branch '$PHP_REPO_BRANCH' '$PHP_REPO_URL' /tmp/php_site_install
+      cp -a /tmp/php_site_install/. /var/www/html/
+      chown -R www-data:www-data /var/www/html || true
+    " || err "Failed to clone/copy PHP repo inside php-fpm container."
   fi
 
-  # Do everything inside the running PHP container so we don't need git/composer on host.
-  $DOCKER exec laravel-php bash -lc "
-    set -euo pipefail
-
-    rm -rf /tmp/ha_configurator_install
-    mkdir -p /tmp/ha_configurator_install
-
-    echo '[laravel] Cloning repo...'
-    git clone --depth 1 --branch '$LARAVEL_REPO_BRANCH' '$LARAVEL_REPO_URL' /tmp/ha_configurator_install
-
-    echo '[laravel] Copying into /var/www/html (bind mount)...'
-    cp -a /tmp/ha_configurator_install/. /var/www/html/
-
-    if [ -f /var/www/html/composer.json ]; then
-      echo '[laravel] Running composer install...'
+  # If repo actually needs composer, do it (harmless for plain PHP repos without composer.json)
+  if [[ -f "$app_dir/composer.json" && ! -f "$app_dir/vendor/autoload.php" ]]; then
+    log "composer.json found but vendor/autoload.php missing -> running composer install..."
+    $DOCKER exec php-fpm bash -lc "
+      set -euo pipefail
+      cd /var/www/html
       composer install --no-interaction --prefer-dist --optimize-autoloader
-    fi
+    " || err "composer install failed inside php-fpm"
+  fi
 
-    if [ -f /var/www/html/.env.example ] && [ ! -f /var/www/html/.env ]; then
-      echo '[laravel] Creating .env from .env.example...'
-      cp /var/www/html/.env.example /var/www/html/.env
-    fi
+  # Set nginx docroot automatically: use /public if present
+  if [[ -f "$app_dir/public/index.php" || -f "$app_dir/public/index.html" ]]; then
+    log "Detected public/ directory -> setting nginx root to /var/www/html/public"
+    write_php_nginx_conf "public"
+  else
+    log "No public/ detected -> setting nginx root to /var/www/html"
+    write_php_nginx_conf ""
+  fi
 
-    if [ -f /var/www/html/artisan ]; then
-      echo '[laravel] Generating app key...'
-      php artisan key:generate --force || true
-
-      echo '[laravel] Creating storage link (if applicable)...'
-      php artisan storage:link || true
-
-      echo '[laravel] Clearing caches...'
-      php artisan config:clear || true
-      php artisan route:clear || true
-      php artisan view:clear || true
-    fi
-
-    echo '[laravel] Fixing permissions...'
-    chown -R www-data:www-data /var/www/html || true
-    mkdir -p /var/www/html/storage /var/www/html/bootstrap/cache || true
-    chmod -R ug+rwX /var/www/html/storage /var/www/html/bootstrap/cache || true
-  " || warn "Laravel GitHub install failed (container may still be building). Re-run setup.sh later."
+  log "Reloading nginx to apply docroot..."
+  $DOCKER exec php-nginx nginx -s reload >/dev/null 2>&1 || true
 }
 
 restart_homeassistant() {
@@ -524,7 +539,7 @@ main() {
   ensure_ha_influxdb_config
 
   start_stack
-  install_laravel_from_github
+  install_php_site_from_github
   restart_homeassistant
 
   echo ""
@@ -538,7 +553,7 @@ main() {
   echo -e "  Home Assistant : ${GREEN}http://${HOST_IP}:8123${NC}"
   echo -e "  Node-RED       : ${GREEN}http://${HOST_IP}:1880${NC}"
   echo -e "  InfluxDB       : ${GREEN}http://${HOST_IP}:8086${NC}"
-  echo -e "  Laravel        : ${GREEN}http://${HOST_IP}:8080${NC}"
+  echo -e "  PHP site       : ${GREEN}http://${HOST_IP}:8080${NC}"
   echo -e "  MQTT           : ${GREEN}${HOST_IP}:1883${NC}"
 }
 
