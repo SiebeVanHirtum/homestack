@@ -1,0 +1,82 @@
+{
+  "device_info": {
+    "model": "Plug S v2",
+    "manufacturer": "Shelly"
+  },
+  "setup": {
+    "endpoint": "/rpc/MQTT.SetConfig",
+    "reboot_endpoint": "/rpc/Shelly.Reboot",
+    "payload_structure": {
+      "config": {
+        "enable": true,
+        "server": "MQTT_SERVER",
+        "user": "MQTT_USER",
+        "pass": "MQTT_PASS",
+        "topic_prefix": "DEVICE_ID"
+      }
+    }
+  },
+  "entities": [
+    {
+      "type": "switch",
+      "id": "switch",
+      "suffix": "_switch",
+      "config": {
+        "state_topic": "/status/switch:0",
+        "command_topic": "/rpc",
+        "payload_on": "{\"id\":1,\"src\":\"homeassistant\",\"method\":\"Switch.Set\",\"params\":{\"id\":0,\"on\":true}}",
+        "payload_off": "{\"id\":1,\"src\":\"homeassistant\",\"method\":\"Switch.Set\",\"params\":{\"id\":0,\"on\":false}}",
+        "value_template": "{{ 'ON' if value_json.output else 'OFF' }}"
+      }
+    },
+    {
+      "type": "sensor",
+      "id": "power",
+      "suffix": "_power",
+      "config": {
+        "state_topic": "/status/switch:0",
+        "unit_of_measurement": "W",
+        "device_class": "power",
+        "state_class": "measurement",
+        "value_template": "{{ value_json.apower }}"
+      }
+    },
+    {
+      "type": "sensor",
+      "id": "voltage",
+      "suffix": "_voltage",
+      "config": {
+        "state_topic": "/status/switch:0",
+        "unit_of_measurement": "V",
+        "device_class": "voltage",
+        "state_class": "measurement",
+        "value_template": "{{ value_json.voltage }}"
+      }
+    },
+    {
+      "type": "sensor",
+      "id": "current",
+      "suffix": "_current",
+      "config": {
+        "state_topic": "/status/switch:0",
+        "unit_of_measurement": "A",
+        "device_class": "current",
+        "state_class": "measurement",
+        "value_template": "{{ value_json.current }}"
+      }
+    },
+    {
+      "type": "sensor",
+      "id": "energy",
+      "suffix": "_energy",
+      "config": {
+        "state_topic": "/status/switch:0",
+        "unit_of_measurement": "Wh",
+        "device_class": "energy",
+        "state_class": "total_increasing",
+        "value_template": "{{ value_json.aenergy.total }}"
+      }
+    }
+  ]
+}
+
