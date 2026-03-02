@@ -241,9 +241,6 @@ EOF
 #!/bin/sh
 set -eu
 
-# InfluxDB docker init uses a CLI config name "default".
-# If the container restarts mid-init, that config may already exist and init loops forever.
-# Clearing it makes the init process idempotent and allows setup to complete.
 rm -f /root/.influxdbv2/configs 2>/dev/null || true
 rm -rf /root/.influxdbv2 2>/dev/null || true
 
@@ -348,7 +345,6 @@ read_env_var() {
 }
 
 ensure_influx_token() {
-  # Only generate token on FIRST init (when influxd.bolt doesn't exist yet)
   local bolt="$DATA_DIR/influxdb/influxd.bolt"
   local env_file="$SCRIPT_DIR/.env"
   local tok
@@ -368,7 +364,6 @@ ensure_influx_token() {
       new_token="$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 64)"
     fi
 
-    # update/append in .env without sourcing it
     if grep -qE '^INFLUXDB_TOKEN=' "$env_file"; then
       if file_is_writable "$env_file"; then
         sed -i "s|^INFLUXDB_TOKEN=.*|INFLUXDB_TOKEN=${new_token}|" "$env_file"
@@ -413,7 +408,6 @@ EOF
     log "configuration.yaml already has influxdb: block (leaving as-is)."
   fi
 
-  # If secrets are missing OR still placeholders, set them to match .env
   if ! grep -qE '^[[:space:]]*influxdb_token:' "$sec" || grep -qE '^[[:space:]]*influxdb_token:[[:space:]]*("?changeme-token"?)' "$sec"; then
     log "Setting influxdb_token in secrets.yaml from .env"
     sed_inplace_delete "$sec" '/^[[:space:]]*influxdb_token:/d'
@@ -433,75 +427,120 @@ start_stack() {
   log "Starting stack..."
   cd "$SCRIPT_DIR"
 
-  # Important: recreate InfluxDB to apply entrypoint wrapper (fixes init loop)
   $COMPOSE up -d --remove-orphans --force-recreate influxdb
-
-  # Then bring up everything else
   $COMPOSE up -d --remove-orphans
 
   log "Stack started."
 }
 
+wait_for_container_running() {
+  local name="$1"
+  local timeout="${2:-180}"
+  local start_ts now_ts
+
+  start_ts="$(date +%s)"
+  while true; do
+    if $DOCKER inspect -f '{{.State.Running}}' "$name" >/dev/null 2>&1; then
+      local running
+      running="$($DOCKER inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo "false")"
+      if [[ "$running" == "true" ]]; then
+        return 0
+      fi
+    fi
+
+    now_ts="$(date +%s)"
+    if (( now_ts - start_ts > timeout )); then
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 install_laravel_from_github() {
-  # Install a Laravel project from GitHub into the bind-mounted volume (/var/www/html)
-  # This replaces composer create-project.
-  local marker="$DATA_DIR/laravel/app/artisan"
+  # Goal:
+  # - Ensure code exists in /var/www/html (bind-mounted to ./data/laravel/app)
+  # - Ensure vendor/autoload.php exists (composer install done)
+  local code_dir="$DATA_DIR/laravel/app"
+  local vendor_autoload="$code_dir/vendor/autoload.php"
+  local composer_json="$code_dir/composer.json"
 
-  if [[ -f "$marker" ]]; then
-    log "Laravel already present ($marker exists), skipping GitHub install."
+  log "Ensuring Laravel project is installed from GitHub: $LARAVEL_REPO_URL (branch: $LARAVEL_REPO_BRANCH)"
+
+  if ! wait_for_container_running "laravel-php" 240; then
+    warn "laravel-php is not running yet. Skipping Laravel install for now."
+    warn "Re-run setup.sh once the container is up."
     return
   fi
 
-  log "Installing Laravel project from GitHub: $LARAVEL_REPO_URL (branch: $LARAVEL_REPO_BRANCH)"
+  # If code is missing, clone it.
+  if [[ ! -f "$composer_json" ]]; then
+    if [[ -n "$(ls -A "$code_dir" 2>/dev/null || true)" ]]; then
+      warn "$code_dir is not empty but composer.json not found. Not overwriting."
+      warn "If you want a clean install, empty that directory and re-run setup.sh"
+      return
+    fi
 
-  # If directory isn't empty (e.g. leftover files), don't clobber silently.
-  if [[ -n "$(ls -A "$DATA_DIR/laravel/app" 2>/dev/null || true)" ]]; then
-    warn "$DATA_DIR/laravel/app is not empty, but artisan not found. Not overwriting."
-    warn "If you want a clean install, empty that directory and re-run setup.sh"
-    return
+    log "Cloning Laravel repo into bind-mounted directory..."
+    $DOCKER exec laravel-php bash -lc "
+      set -euo pipefail
+      rm -rf /var/www/html/*
+      git clone --depth 1 --branch '$LARAVEL_REPO_BRANCH' '$LARAVEL_REPO_URL' /var/www/html
+      chown -R www-data:www-data /var/www/html || true
+    " || err "Failed to clone Laravel repo into /var/www/html"
+  else
+    log "Laravel code already present (composer.json exists)."
   fi
 
-  # Do everything inside the running PHP container so we don't need git/composer on host.
+  # If vendor is missing, run composer install.
+  if [[ ! -f "$vendor_autoload" ]]; then
+    log "Installing Composer dependencies (vendor/ missing)..."
+    $DOCKER exec laravel-php bash -lc "
+      set -euo pipefail
+      cd /var/www/html
+      if [ -f composer.json ]; then
+        composer install --no-interaction --prefer-dist --optimize-autoloader
+      else
+        echo 'composer.json not found in /var/www/html' >&2
+        exit 1
+      fi
+    " || err "composer install failed inside laravel-php. Check output above."
+  else
+    log "Composer dependencies already installed (vendor/autoload.php exists)."
+  fi
+
+  # Ensure .env exists
   $DOCKER exec laravel-php bash -lc "
     set -euo pipefail
-
-    rm -rf /tmp/ha_configurator_install
-    mkdir -p /tmp/ha_configurator_install
-
-    echo '[laravel] Cloning repo...'
-    git clone --depth 1 --branch '$LARAVEL_REPO_BRANCH' '$LARAVEL_REPO_URL' /tmp/ha_configurator_install
-
-    echo '[laravel] Copying into /var/www/html (bind mount)...'
-    cp -a /tmp/ha_configurator_install/. /var/www/html/
-
-    if [ -f /var/www/html/composer.json ]; then
-      echo '[laravel] Running composer install...'
-      composer install --no-interaction --prefer-dist --optimize-autoloader
+    cd /var/www/html
+    if [ -f .env.example ] && [ ! -f .env ]; then
+      cp .env.example .env
     fi
+  " || warn "Could not create .env from .env.example (non-fatal)."
 
-    if [ -f /var/www/html/.env.example ] && [ ! -f /var/www/html/.env ]; then
-      echo '[laravel] Creating .env from .env.example...'
-      cp /var/www/html/.env.example /var/www/html/.env
-    fi
+  # App key + permissions
+  $DOCKER exec laravel-php bash -lc "
+    set -euo pipefail
+    cd /var/www/html
 
-    if [ -f /var/www/html/artisan ]; then
-      echo '[laravel] Generating app key...'
+    if [ -f artisan ]; then
       php artisan key:generate --force || true
-
-      echo '[laravel] Creating storage link (if applicable)...'
       php artisan storage:link || true
-
-      echo '[laravel] Clearing caches...'
       php artisan config:clear || true
       php artisan route:clear || true
       php artisan view:clear || true
     fi
 
-    echo '[laravel] Fixing permissions...'
     chown -R www-data:www-data /var/www/html || true
     mkdir -p /var/www/html/storage /var/www/html/bootstrap/cache || true
     chmod -R ug+rwX /var/www/html/storage /var/www/html/bootstrap/cache || true
-  " || warn "Laravel GitHub install failed (container may still be building). Re-run setup.sh later."
+  " || warn "Laravel post-install steps had warnings (non-fatal)."
+
+  # Final sanity check
+  if [[ ! -f "$vendor_autoload" ]]; then
+    err "Laravel install incomplete: $vendor_autoload is still missing."
+  fi
+
+  log "Laravel project installed and ready."
 }
 
 restart_homeassistant() {
