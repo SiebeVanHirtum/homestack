@@ -272,7 +272,7 @@
         "id": "13f7a29328fc8e4e",
         "type": "mqtt-broker",
         "name": "mqtt-pi",
-        "broker": "10.3.141.1",
+        "broker": "mosquitto",
         "port": 1883,
         "clientid": "",
         "autoConnect": true,
