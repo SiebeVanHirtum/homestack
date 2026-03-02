@@ -4,6 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$SCRIPT_DIR/data"
 
+# Laravel repo to install into ./data/laravel/app
+LARAVEL_REPO_URL="https://github.com/SiebeVanHirtum/HA-Configurator"
+LARAVEL_REPO_BRANCH="main"
+
 DOCKER="docker"
 COMPOSE=""
 
@@ -438,17 +442,66 @@ start_stack() {
   log "Stack started."
 }
 
-init_laravel() {
-  if [[ -f "$DATA_DIR/laravel/app/artisan" ]]; then
-    log "Laravel already initialized, skipping."
+install_laravel_from_github() {
+  # Install a Laravel project from GitHub into the bind-mounted volume (/var/www/html)
+  # This replaces composer create-project.
+  local marker="$DATA_DIR/laravel/app/artisan"
+
+  if [[ -f "$marker" ]]; then
+    log "Laravel already present ($marker exists), skipping GitHub install."
     return
   fi
-  log "Initializing Laravel project..."
-  $DOCKER exec laravel-php bash -c "
-    composer create-project laravel/laravel /tmp/laravel --prefer-dist --quiet &&
-    cp -r /tmp/laravel/. /var/www/html/ &&
-    chown -R www-data:www-data /var/www/html
-  " || warn "Laravel init failed (container may still be building). Re-run setup.sh later."
+
+  log "Installing Laravel project from GitHub: $LARAVEL_REPO_URL (branch: $LARAVEL_REPO_BRANCH)"
+
+  # If directory isn't empty (e.g. leftover files), don't clobber silently.
+  if [[ -n "$(ls -A "$DATA_DIR/laravel/app" 2>/dev/null || true)" ]]; then
+    warn "$DATA_DIR/laravel/app is not empty, but artisan not found. Not overwriting."
+    warn "If you want a clean install, empty that directory and re-run setup.sh"
+    return
+  fi
+
+  # Do everything inside the running PHP container so we don't need git/composer on host.
+  $DOCKER exec laravel-php bash -lc "
+    set -euo pipefail
+
+    rm -rf /tmp/ha_configurator_install
+    mkdir -p /tmp/ha_configurator_install
+
+    echo '[laravel] Cloning repo...'
+    git clone --depth 1 --branch '$LARAVEL_REPO_BRANCH' '$LARAVEL_REPO_URL' /tmp/ha_configurator_install
+
+    echo '[laravel] Copying into /var/www/html (bind mount)...'
+    cp -a /tmp/ha_configurator_install/. /var/www/html/
+
+    if [ -f /var/www/html/composer.json ]; then
+      echo '[laravel] Running composer install...'
+      composer install --no-interaction --prefer-dist --optimize-autoloader
+    fi
+
+    if [ -f /var/www/html/.env.example ] && [ ! -f /var/www/html/.env ]; then
+      echo '[laravel] Creating .env from .env.example...'
+      cp /var/www/html/.env.example /var/www/html/.env
+    fi
+
+    if [ -f /var/www/html/artisan ]; then
+      echo '[laravel] Generating app key...'
+      php artisan key:generate --force || true
+
+      echo '[laravel] Creating storage link (if applicable)...'
+      php artisan storage:link || true
+
+      echo '[laravel] Clearing caches...'
+      php artisan config:clear || true
+      php artisan route:clear || true
+      php artisan view:clear || true
+    fi
+
+    echo '[laravel] Fixing permissions...'
+    chown -R www-data:www-data /var/www/html || true
+    mkdir -p /var/www/html/storage /var/www/html/bootstrap/cache || true
+    chmod -R ug+rwX /var/www/html/storage /var/www/html/bootstrap/cache || true
+  " || warn "Laravel GitHub install failed (container may still be building). Re-run setup.sh later."
 }
 
 restart_homeassistant() {
@@ -471,7 +524,7 @@ main() {
   ensure_ha_influxdb_config
 
   start_stack
-  init_laravel
+  install_laravel_from_github
   restart_homeassistant
 
   echo ""
