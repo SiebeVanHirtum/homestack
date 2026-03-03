@@ -348,18 +348,35 @@ EOF
   fi
 }
 
+# FIXED: read_env_var previously always returned failure due to `END{exit 1}`
 read_env_var() {
   local key="$1"
   local file="$SCRIPT_DIR/.env"
   [[ -f "$file" ]] || return 1
-  awk -F= -v k="$key" '$1==k{print substr($0, index($0,$2)); exit 0} END{exit 1}' "$file"
+
+  awk -v k="$key" '
+    BEGIN { found=0 }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    {
+      line=$0
+      sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+      if (index(line, k "=") == 1) {
+        val = substr(line, length(k) + 2)  # everything after "KEY="
+        print val
+        found=1
+        exit
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$file"
 }
 
 ensure_influx_token() {
   local bolt="$DATA_DIR/influxdb/influxd.bolt"
   local env_file="$SCRIPT_DIR/.env"
-  local tok
-  tok="$(read_env_var INFLUXDB_TOKEN || echo "")"
+  local tok=""
+  tok="$(read_env_var INFLUXDB_TOKEN 2>/dev/null || echo "")"
 
   if [[ -f "$bolt" ]]; then
     log "InfluxDB already initialized (found influxd.bolt). Keeping existing INFLUXDB_TOKEN."
@@ -375,16 +392,20 @@ ensure_influx_token() {
       new_token="$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 64)"
     fi
 
-    if grep -qE '^INFLUXDB_TOKEN=' "$env_file"; then
+    if grep -qE '^[[:space:]]*INFLUXDB_TOKEN=' "$env_file"; then
       if file_is_writable "$env_file"; then
-        sed -i "s|^INFLUXDB_TOKEN=.*|INFLUXDB_TOKEN=${new_token}|" "$env_file"
+        sed -i "s|^[[:space:]]*INFLUXDB_TOKEN=.*|INFLUXDB_TOKEN=${new_token}|" "$env_file"
       else
-        sudo sed -i "s|^INFLUXDB_TOKEN=.*|INFLUXDB_TOKEN=${new_token}|" "$env_file"
+        sudo sed -i "s|^[[:space:]]*INFLUXDB_TOKEN=.*|INFLUXDB_TOKEN=${new_token}|" "$env_file"
       fi
     else
       append_file "$env_file" $'\n'"INFLUXDB_TOKEN=${new_token}"$'\n'
     fi
   fi
+
+  # Sanity check: token must now be readable
+  tok="$(read_env_var INFLUXDB_TOKEN 2>/dev/null || echo "")"
+  [[ -n "$tok" && "$tok" != "changeme-token" ]] || err "Failed to ensure a valid INFLUXDB_TOKEN in .env"
 }
 
 ensure_ha_influxdb_config() {
@@ -392,9 +413,11 @@ ensure_ha_influxdb_config() {
   local sec="$DATA_DIR/homeassistant/secrets.yaml"
 
   local tok org bucket
-  tok="$(read_env_var INFLUXDB_TOKEN || echo "")"
-  org="$(read_env_var INFLUXDB_ORG || echo "homestack")"
-  bucket="$(read_env_var INFLUXDB_BUCKET || echo "home")"
+  tok="$(read_env_var INFLUXDB_TOKEN 2>/dev/null || echo "")"
+  org="$(read_env_var INFLUXDB_ORG 2>/dev/null || echo "homestack")"
+  bucket="$(read_env_var INFLUXDB_BUCKET 2>/dev/null || echo "home")"
+
+  [[ -n "$tok" && "$tok" != "changeme-token" ]] || err "INFLUXDB_TOKEN is missing/invalid in .env (cannot write HA secrets)."
 
   if ! grep -qE '^[[:space:]]*influxdb:' "$ha_conf"; then
     log "Adding InfluxDB v2 integration to Home Assistant configuration.yaml"
@@ -419,18 +442,21 @@ EOF
     log "configuration.yaml already has influxdb: block (leaving as-is)."
   fi
 
-  if ! grep -qE '^[[:space:]]*influxdb_token:' "$sec" || grep -qE '^[[:space:]]*influxdb_token:[[:space:]]*("?changeme-token"?)' "$sec"; then
-    log "Setting influxdb_token in secrets.yaml from .env"
-    sed_inplace_delete "$sec" '/^[[:space:]]*influxdb_token:/d'
-    append_file "$sec" "influxdb_token: \"${tok}\""$'\n'
+  # Ensure secrets.yaml exists
+  if [[ ! -f "$sec" ]]; then
+    log "secrets.yaml missing -> creating"
+    write_file "$sec" "# Add your secrets here"$'\n'
   fi
 
-  if ! grep -qE '^[[:space:]]*influxdb_org:' "$sec"; then
-    append_file "$sec" "influxdb_org: \"${org}\""$'\n'
-  fi
-  if ! grep -qE '^[[:space:]]*influxdb_bucket:' "$sec"; then
-    append_file "$sec" "influxdb_bucket: \"${bucket}\""$'\n'
-  fi
+  # Always (re)sync the token from .env to secrets.yaml so HA never breaks
+  log "Syncing influxdb_token/influxdb_org/influxdb_bucket into secrets.yaml from .env"
+  sed_inplace_delete "$sec" '/^[[:space:]]*influxdb_token:/d'
+  sed_inplace_delete "$sec" '/^[[:space:]]*influxdb_org:/d'
+  sed_inplace_delete "$sec" '/^[[:space:]]*influxdb_bucket:/d'
+
+  append_file "$sec" "influxdb_token: \"${tok}\""$'\n'
+  append_file "$sec" "influxdb_org: \"${org}\""$'\n'
+  append_file "$sec" "influxdb_bucket: \"${bucket}\""$'\n'
 }
 
 start_stack() {
