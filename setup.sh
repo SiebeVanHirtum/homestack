@@ -326,8 +326,13 @@ copy_optional_files() {
   else
     warn "homeassistant/dashboards/ not found in repo — creating placeholder"
     mkdir -p "$DASH_DEST"
-    if [[ ! -f "$DASH_DEST/main_dash.yaml" ]]; then
-      write_file "$DASH_DEST/main_dash.yaml" "$(cat <<'EOF'
+  fi
+
+  # If main dashboard exists but is empty, write a minimal placeholder (prevents YAML-mode weirdness)
+  local MAIN_DASH="$DATA_DIR/homeassistant/dashboards/main_dash.yaml"
+  if [[ -f "$MAIN_DASH" && ! -s "$MAIN_DASH" ]]; then
+    warn "homeassistant/dashboards/main_dash.yaml is empty; writing placeholder dashboard."
+    write_file "$MAIN_DASH" "$(cat <<'EOF'
 views:
   - title: Home
     cards:
@@ -335,7 +340,16 @@ views:
         content: "## Welcome to Homestack!\nAdd your cards here."
 EOF
 )"
-    fi
+  elif [[ ! -f "$MAIN_DASH" ]]; then
+    # If dashboards folder exists but main file doesn't, also create it
+    write_file "$MAIN_DASH" "$(cat <<'EOF'
+views:
+  - title: Home
+    cards:
+      - type: markdown
+        content: "## Welcome to Homestack!\nAdd your cards here."
+EOF
+)"
   fi
 
   local SEC_DEST="$DATA_DIR/homeassistant/secrets.yaml"
@@ -493,6 +507,39 @@ wait_for_container_running() {
   done
 }
 
+# NEW: avoid restarting HA during its first-boot initialization (can trigger recovery mode)
+wait_for_ha_initialized() {
+  local timeout="${1:-420}"
+  local start_ts now_ts
+
+  log "Waiting for Home Assistant to finish initial startup (timeout: ${timeout}s)..."
+  start_ts="$(date +%s)"
+
+  while true; do
+    # Common log line once HA is fully up
+    if $DOCKER logs homeassistant 2>/dev/null | grep -q "Home Assistant initialized"; then
+      log "Home Assistant reports: initialized"
+      return 0
+    fi
+
+    # If it enters recovery, surface logs early
+    if $DOCKER logs homeassistant 2>/dev/null | grep -q "Activating recovery mode"; then
+      warn "Home Assistant entered recovery mode. Recent logs:"
+      $DOCKER logs --tail 250 homeassistant || true
+      return 1
+    fi
+
+    now_ts="$(date +%s)"
+    if (( now_ts - start_ts > timeout )); then
+      warn "Timed out waiting for Home Assistant initialization."
+      $DOCKER logs --tail 250 homeassistant || true
+      return 1
+    fi
+
+    sleep 5
+  done
+}
+
 install_php_site_from_github() {
   local app_dir="$DATA_DIR/php/app"
 
@@ -564,9 +611,24 @@ main() {
   ensure_influx_token
   ensure_ha_influxdb_config
 
+  # Detect whether HA container already existed before this run (rerun vs fresh)
+  local HA_ALREADY_EXISTS=0
+  if $DOCKER inspect homeassistant >/dev/null 2>&1; then
+    HA_ALREADY_EXISTS=1
+  fi
+
   start_stack
   install_php_site_from_github
-  restart_homeassistant
+
+  # IMPORTANT FIX:
+  # On a fresh install, do NOT immediately restart HA (can interrupt first-boot initialization and trigger recovery mode).
+  # On reruns, restart is OK to apply config changes.
+  if (( HA_ALREADY_EXISTS == 1 )); then
+    restart_homeassistant
+  else
+    log "First install detected: skipping immediate Home Assistant restart (prevents recovery mode on first boot)."
+    wait_for_ha_initialized 420 || warn "Home Assistant did not fully initialize; review logs above."
+  fi
 
   echo ""
   log "=== Setup Complete ==="
@@ -579,7 +641,7 @@ main() {
   echo -e "  Home Assistant : ${GREEN}http://${HOST_IP}:8123${NC}"
   echo -e "  Node-RED       : ${GREEN}http://${HOST_IP}:1880${NC}"
   echo -e "  InfluxDB       : ${GREEN}http://${HOST_IP}:8086${NC}"
-  echo -e "  PHP site       : ${GREEN}http://${HOST_IP}:8080${NC}"
+  echo -e "  PHP site       : ${GREEN}http://${HOST_IP}:80${NC}"
   echo -e "  MQTT           : ${GREEN}${HOST_IP}:1883${NC}"
 }
 
