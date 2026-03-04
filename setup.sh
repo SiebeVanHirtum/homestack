@@ -8,6 +8,10 @@ DATA_DIR="$SCRIPT_DIR/data"
 PHP_REPO_URL="https://github.com/SiebeVanHirtum/HA-Configurator"
 PHP_REPO_BRANCH="main"
 
+# 1 = write Home Assistant InfluxDB config automatically (INLINE token; no secrets => no recovery-mode from missing secrets)
+# 0 = do not touch HA config (manual HA integration setup)
+AUTO_CONFIG_HA_INFLUXDB="${AUTO_CONFIG_HA_INFLUXDB:-1}"
+
 DOCKER="docker"
 COMPOSE=""
 
@@ -44,6 +48,61 @@ detect_compose_cmd() {
   COMPOSE=""
 }
 
+apt_wait_for_locks() {
+  # On fresh installs, unattended-upgrades/cloud-init often holds dpkg/apt locks.
+  # If 'fuser' is missing, skip lock waiting (we'll rely on retries).
+  command -v fuser &>/dev/null || return 0
+
+  local timeout="${1:-180}"
+  local start now
+  start="$(date +%s)"
+
+  while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+     || sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+     || sudo fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    now="$(date +%s)"
+    if (( now - start > timeout )); then
+      warn "APT locks still held after ${timeout}s."
+      return 1
+    fi
+    warn "APT is locked by another process; waiting..."
+    sleep 5
+  done
+  return 0
+}
+
+apt_update_retry() {
+  local tries="${1:-3}"
+  local i
+  for ((i=1; i<=tries; i++)); do
+    apt_wait_for_locks 300 || true
+    log "Running apt-get update (attempt $i/$tries)..."
+    if sudo apt-get update; then
+      return 0
+    fi
+    warn "apt-get update failed (attempt $i/$tries). Retrying in 10s..."
+    sleep 10
+  done
+  return 1
+}
+
+apt_install_retry() {
+  # usage: apt_install_retry pkg1 pkg2 ...
+  local tries=3
+  local i
+  for ((i=1; i<=tries; i++)); do
+    apt_wait_for_locks 300 || true
+    log "Installing packages: $* (attempt $i/$tries)..."
+    if sudo apt-get install -y "$@"; then
+      return 0
+    fi
+    warn "apt-get install failed (attempt $i/$tries). Retrying in 10s..."
+    sleep 10
+    apt_update_retry 2 || true
+  done
+  return 1
+}
+
 purge_bad_docker_apt_repo() {
   local pattern="download.docker.com/linux/ubuntu"
   local hits=()
@@ -52,19 +111,20 @@ purge_bad_docker_apt_repo() {
     grep -RIlZ "$pattern" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true
   )
 
-  ((${#hits[@]} == 0)) && return
+  ((${#hits[@]} == 0)) && return 0
 
   warn "Found APT entries pointing to Docker's Ubuntu repo (breaks apt on Debian trixie)."
   for f in "${hits[@]}"; do
     if [[ "$f" == "/etc/apt/sources.list" ]]; then
       warn "Bad entry is in /etc/apt/sources.list (not auto-editing). Remove that line manually, then re-run."
-      continue
+      return 1
     fi
     warn "Removing broken repo file: $f"
     sudo rm -f "$f"
   done
 
   [[ -f /etc/apt/keyrings/docker.gpg ]] && sudo rm -f /etc/apt/keyrings/docker.gpg || true
+  return 0
 }
 
 install_docker_and_compose() {
@@ -74,35 +134,56 @@ install_docker_and_compose() {
 
   command -v apt-get &>/dev/null || err "This script currently expects apt-get. Install Docker/Compose manually otherwise."
 
-  [[ "${ID:-}" == "debian" ]] && purge_bad_docker_apt_repo
+  if [[ "${ID:-}" == "debian" ]]; then
+    purge_bad_docker_apt_repo || err "Fix APT sources as noted above, then re-run."
+  fi
 
-  sudo apt-get update
+  apt_update_retry 3 || err "apt-get update failed repeatedly. Check your network/DNS or apt sources."
+
+  # Tools used by this script (fuser for lock detection)
+  apt_install_retry ca-certificates psmisc >/dev/null 2>&1 || true
 
   if ! command -v docker &>/dev/null; then
-    log "Installing Docker Engine from OS repos..."
-    sudo apt-get install -y docker.io
-    sudo systemctl enable --now docker
+    log "Installing Docker Engine from OS repos (docker.io)..."
+    apt_install_retry docker.io || err "Failed to install docker.io from apt."
+    sudo systemctl enable --now docker || true
   else
     log "Docker already installed: $(docker --version)"
   fi
 
-  sudo usermod -aG docker "$USER" || true
-  detect_docker_cmd
+  # Docker group (won't take effect in current shell; we still support sudo docker)
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    sudo usermod -aG docker "$SUDO_USER" 2>/dev/null || true
+  elif [[ -n "${USER:-}" ]]; then
+    sudo usermod -aG docker "$USER" 2>/dev/null || true
+  fi
 
+  detect_docker_cmd
   detect_compose_cmd
+
   if [[ -z "$COMPOSE" ]]; then
-    log "Installing Docker Compose..."
-    if sudo apt-get install -y docker-compose-v2 2>/dev/null; then
+    log "Installing Docker Compose (trying apt packages)..."
+    if apt_install_retry docker-compose-v2; then
       :
-    elif sudo apt-get install -y docker-compose 2>/dev/null; then
+    elif apt_install_retry docker-compose-plugin; then
+      :
+    elif apt_install_retry docker-compose; then
       :
     else
-      err "Could not install Docker Compose from apt. Install Compose manually, then re-run."
+      # Last resort: pipx docker-compose (works broadly on Debian snapshots)
+      warn "Could not install Compose via apt. Falling back to pipx docker-compose..."
+      apt_install_retry python3 python3-venv pipx || err "Failed to install pipx prerequisites."
+      pipx ensurepath >/dev/null 2>&1 || true
+      command -v pipx &>/dev/null || err "pipx not available after install; cannot continue."
+      pipx install docker-compose || true
+      if [[ -x "$HOME/.local/bin/docker-compose" ]]; then
+        sudo ln -sf "$HOME/.local/bin/docker-compose" /usr/local/bin/docker-compose || true
+      fi
     fi
   fi
 
   detect_compose_cmd
-  [[ -n "$COMPOSE" ]] || err "Docker Compose is still not available."
+  [[ -n "$COMPOSE" ]] || err "Docker Compose is still not available after install attempts."
 
   log "Using Docker cmd: $DOCKER"
   log "Using Compose cmd: $COMPOSE"
@@ -140,6 +221,27 @@ sed_inplace_delete() {
   fi
 }
 
+sed_inplace_replace() {
+  local path="$1"
+  local expr="$2"
+  if [[ -e "$path" ]] && ! file_is_writable "$path"; then
+    sudo sed -i "$expr" "$path" || true
+  else
+    sed -i "$expr" "$path" || true
+  fi
+}
+
+sed_escape_repl() {
+  # Escape for sed replacement part (delimiter is assumed to be #)
+  # Escapes \, &, and #
+  printf '%s' "$1" | sed -e 's/[\/&\\#]/\\&/g'
+}
+
+yaml_single_quote_escape() {
+  # For YAML single-quoted scalars: single quote is represented as doubled ''
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
 create_dirs() {
   log "Creating data directories under $DATA_DIR"
 
@@ -148,6 +250,7 @@ create_dirs() {
   mkdir -p \
     "$DATA_DIR/homeassistant" \
     "$DATA_DIR/homeassistant/.storage" \
+    "$DATA_DIR/homeassistant/dashboards" \
     "$DATA_DIR/nodered" \
     "$DATA_DIR/influxdb" \
     "$DATA_DIR/mosquitto/config" \
@@ -238,6 +341,7 @@ exec /entrypoint.sh "$@"
 EOF
 )"
   fi
+  sudo chmod +x "$INFLUX_EP" 2>/dev/null || chmod +x "$INFLUX_EP" 2>/dev/null || true
 
   # PHP-FPM image
   local PHP_DF="$SCRIPT_DIR/php/Dockerfile"
@@ -250,7 +354,6 @@ RUN apt-get update && apt-get install -y \
     git unzip \
   && rm -rf /var/lib/apt/lists/*
 
-# Optional: composer (useful if repo has composer.json, even if you say "no framework")
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 
 WORKDIR /var/www/html
@@ -319,29 +422,17 @@ copy_optional_files() {
 
   local DASH_SRC="$SCRIPT_DIR/homeassistant/dashboards"
   local DASH_DEST="$DATA_DIR/homeassistant/dashboards"
+  mkdir -p "$DASH_DEST"
+
   if [[ -d "$DASH_SRC" ]]; then
     log "Installing HA dashboards from repo"
-    mkdir -p "$DASH_DEST"
     cp -r "$DASH_SRC/." "$DASH_DEST/"
-  else
-    warn "homeassistant/dashboards/ not found in repo — creating placeholder"
-    mkdir -p "$DASH_DEST"
   fi
 
-  # If main dashboard exists but is empty, write a minimal placeholder (prevents YAML-mode weirdness)
-  local MAIN_DASH="$DATA_DIR/homeassistant/dashboards/main_dash.yaml"
-  if [[ -f "$MAIN_DASH" && ! -s "$MAIN_DASH" ]]; then
-    warn "homeassistant/dashboards/main_dash.yaml is empty; writing placeholder dashboard."
-    write_file "$MAIN_DASH" "$(cat <<'EOF'
-views:
-  - title: Home
-    cards:
-      - type: markdown
-        content: "## Welcome to Homestack!\nAdd your cards here."
-EOF
-)"
-  elif [[ ! -f "$MAIN_DASH" ]]; then
-    # If dashboards folder exists but main file doesn't, also create it
+  # Ensure main dashboard exists and is non-empty (empty YAML can cause UI issues)
+  local MAIN_DASH="$DASH_DEST/main_dash.yaml"
+  if [[ ! -f "$MAIN_DASH" || ! -s "$MAIN_DASH" ]]; then
+    warn "Writing placeholder dashboard to $MAIN_DASH"
     write_file "$MAIN_DASH" "$(cat <<'EOF'
 views:
   - title: Home
@@ -352,17 +443,14 @@ EOF
 )"
   fi
 
+  # Create secrets.yaml (optional now; we no longer depend on it to avoid recovery-mode)
   local SEC_DEST="$DATA_DIR/homeassistant/secrets.yaml"
   if [[ ! -f "$SEC_DEST" ]]; then
     log "Creating secrets.yaml for HA"
-    write_file "$SEC_DEST" "$(cat <<'EOF'
-# Add your secrets here
-EOF
-)"
+    write_file "$SEC_DEST" "# Add your secrets here"$'\n'
   fi
 }
 
-# FIXED: read_env_var previously always returned failure due to `END{exit 1}`
 read_env_var() {
   local key="$1"
   local file="$SCRIPT_DIR/.env"
@@ -376,7 +464,7 @@ read_env_var() {
       line=$0
       sub(/^[[:space:]]*export[[:space:]]+/, "", line)
       if (index(line, k "=") == 1) {
-        val = substr(line, length(k) + 2)  # everything after "KEY="
+        val = substr(line, length(k) + 2)
         print val
         found=1
         exit
@@ -417,34 +505,53 @@ ensure_influx_token() {
     fi
   fi
 
-  # Sanity check: token must now be readable
   tok="$(read_env_var INFLUXDB_TOKEN 2>/dev/null || echo "")"
   [[ -n "$tok" && "$tok" != "changeme-token" ]] || err "Failed to ensure a valid INFLUXDB_TOKEN in .env"
 }
 
-ensure_ha_influxdb_config() {
+configure_ha_influxdb_inline() {
   local ha_conf="$DATA_DIR/homeassistant/configuration.yaml"
-  local sec="$DATA_DIR/homeassistant/secrets.yaml"
 
   local tok org bucket
   tok="$(read_env_var INFLUXDB_TOKEN 2>/dev/null || echo "")"
   org="$(read_env_var INFLUXDB_ORG 2>/dev/null || echo "homestack")"
   bucket="$(read_env_var INFLUXDB_BUCKET 2>/dev/null || echo "home")"
 
-  [[ -n "$tok" && "$tok" != "changeme-token" ]] || err "INFLUXDB_TOKEN is missing/invalid in .env (cannot write HA secrets)."
+  [[ -n "$tok" && "$tok" != "changeme-token" ]] || err "INFLUXDB_TOKEN is missing/invalid in .env (cannot auto-configure HA)."
 
-  if ! grep -qE '^[[:space:]]*influxdb:' "$ha_conf"; then
-    log "Adding InfluxDB v2 integration to Home Assistant configuration.yaml"
-    append_file "$ha_conf" "$(cat <<'EOF'
+  # YAML single-quoted scalars; safer for tokens
+  local tok_q org_q bucket_q
+  tok_q="$(yaml_single_quote_escape "$tok")"
+  org_q="$(yaml_single_quote_escape "$org")"
+  bucket_q="$(yaml_single_quote_escape "$bucket")"
+
+  if grep -qE '^[[:space:]]*influxdb:' "$ha_conf"; then
+    # If user already has an influxdb block, do NOT try to reformat it.
+    # BUT: if it references secrets that might not exist, replace those lines with inline values.
+    log "Home Assistant configuration.yaml already has influxdb: block; ensuring it does not depend on missing secrets."
+
+    local tok_repl org_repl bucket_repl
+    tok_repl="$(sed_escape_repl "token: '${tok_q}'")"
+    org_repl="$(sed_escape_repl "organization: '${org_q}'")"
+    bucket_repl="$(sed_escape_repl "bucket: '${bucket_q}'")"
+
+    sed_inplace_replace "$ha_conf" "s#^[[:space:]]*token:[[:space:]]*!secret[[:space:]]\+influxdb_token[[:space:]]*\$#  ${tok_repl}#"
+    sed_inplace_replace "$ha_conf" "s#^[[:space:]]*organization:[[:space:]]*!secret[[:space:]]\+influxdb_org[[:space:]]*\$#  ${org_repl}#"
+    sed_inplace_replace "$ha_conf" "s#^[[:space:]]*bucket:[[:space:]]*!secret[[:space:]]\+influxdb_bucket[[:space:]]*\$#  ${bucket_repl}#"
+    return 0
+  fi
+
+  log "Adding InfluxDB v2 integration to Home Assistant configuration.yaml (INLINE token; no secrets)."
+  append_file "$ha_conf" "$(cat <<EOF
 
 influxdb:
   api_version: 2
   host: 127.0.0.1
   port: 8086
   ssl: false
-  token: !secret influxdb_token
-  organization: !secret influxdb_org
-  bucket: !secret influxdb_bucket
+  token: '${tok_q}'
+  organization: '${org_q}'
+  bucket: '${bucket_q}'
   tags:
     source: HA
   tags_attributes:
@@ -452,25 +559,6 @@ influxdb:
   default_measurement: units
 EOF
 )"
-  else
-    log "configuration.yaml already has influxdb: block (leaving as-is)."
-  fi
-
-  # Ensure secrets.yaml exists
-  if [[ ! -f "$sec" ]]; then
-    log "secrets.yaml missing -> creating"
-    write_file "$sec" "# Add your secrets here"$'\n'
-  fi
-
-  # Always (re)sync the token from .env to secrets.yaml so HA never breaks
-  log "Syncing influxdb_token/influxdb_org/influxdb_bucket into secrets.yaml from .env"
-  sed_inplace_delete "$sec" '/^[[:space:]]*influxdb_token:/d'
-  sed_inplace_delete "$sec" '/^[[:space:]]*influxdb_org:/d'
-  sed_inplace_delete "$sec" '/^[[:space:]]*influxdb_bucket:/d'
-
-  append_file "$sec" "influxdb_token: \"${tok}\""$'\n'
-  append_file "$sec" "influxdb_org: \"${org}\""$'\n'
-  append_file "$sec" "influxdb_bucket: \"${bucket}\""$'\n'
 }
 
 start_stack() {
@@ -507,22 +595,20 @@ wait_for_container_running() {
   done
 }
 
-# NEW: avoid restarting HA during its first-boot initialization (can trigger recovery mode)
 wait_for_ha_initialized() {
-  local timeout="${1:-420}"
+  # Keep this short: we only use it to avoid restarting HA during first boot.
+  local timeout="${1:-120}"
   local start_ts now_ts
 
-  log "Waiting for Home Assistant to finish initial startup (timeout: ${timeout}s)..."
+  log "Waiting for Home Assistant startup (timeout: ${timeout}s)..."
   start_ts="$(date +%s)"
 
   while true; do
-    # Common log line once HA is fully up
     if $DOCKER logs homeassistant 2>/dev/null | grep -q "Home Assistant initialized"; then
       log "Home Assistant reports: initialized"
       return 0
     fi
 
-    # If it enters recovery, surface logs early
     if $DOCKER logs homeassistant 2>/dev/null | grep -q "Activating recovery mode"; then
       warn "Home Assistant entered recovery mode. Recent logs:"
       $DOCKER logs --tail 250 homeassistant || true
@@ -531,8 +617,7 @@ wait_for_ha_initialized() {
 
     now_ts="$(date +%s)"
     if (( now_ts - start_ts > timeout )); then
-      warn "Timed out waiting for Home Assistant initialization."
-      $DOCKER logs --tail 250 homeassistant || true
+      warn "Timed out waiting for Home Assistant initialization (this is not fatal)."
       return 1
     fi
 
@@ -550,7 +635,6 @@ install_php_site_from_github() {
     return
   fi
 
-  # Determine if already installed
   if [[ -f "$app_dir/index.php" || -f "$app_dir/public/index.php" || -f "$app_dir/index.html" || -f "$app_dir/public/index.html" ]]; then
     log "PHP site already present in $app_dir (skipping clone)."
   else
@@ -569,7 +653,6 @@ install_php_site_from_github() {
     " || err "Failed to clone/copy PHP repo inside php-fpm container."
   fi
 
-  # If repo actually needs composer, do it (harmless for plain PHP repos without composer.json)
   if [[ -f "$app_dir/composer.json" && ! -f "$app_dir/vendor/autoload.php" ]]; then
     log "composer.json found but vendor/autoload.php missing -> running composer install..."
     $DOCKER exec php-fpm bash -lc "
@@ -579,7 +662,6 @@ install_php_site_from_github() {
     " || err "composer install failed inside php-fpm"
   fi
 
-  # Set nginx docroot automatically: use /public if present
   if [[ -f "$app_dir/public/index.php" || -f "$app_dir/public/index.html" ]]; then
     log "Detected public/ directory -> setting nginx root to /var/www/html/public"
     write_php_nginx_conf "public"
@@ -609,7 +691,13 @@ main() {
   fix_permissions
 
   ensure_influx_token
-  ensure_ha_influxdb_config
+
+  # IMPORTANT: if you want "it never breaks HA parsing", avoid secrets entirely.
+  if [[ "$AUTO_CONFIG_HA_INFLUXDB" == "1" ]]; then
+    configure_ha_influxdb_inline
+  else
+    warn "AUTO_CONFIG_HA_INFLUXDB=0 -> not modifying Home Assistant config for InfluxDB."
+  fi
 
   # Detect whether HA container already existed before this run (rerun vs fresh)
   local HA_ALREADY_EXISTS=0
@@ -620,14 +708,12 @@ main() {
   start_stack
   install_php_site_from_github
 
-  # IMPORTANT FIX:
-  # On a fresh install, do NOT immediately restart HA (can interrupt first-boot initialization and trigger recovery mode).
-  # On reruns, restart is OK to apply config changes.
+  # Avoid restarting HA immediately on first boot (can trigger recovery mode on some setups)
   if (( HA_ALREADY_EXISTS == 1 )); then
     restart_homeassistant
   else
-    log "First install detected: skipping immediate Home Assistant restart (prevents recovery mode on first boot)."
-    wait_for_ha_initialized 420 || warn "Home Assistant did not fully initialize; review logs above."
+    log "First install detected: not restarting Home Assistant immediately."
+    wait_for_ha_initialized 120 || true
   fi
 
   echo ""
@@ -643,6 +729,12 @@ main() {
   echo -e "  InfluxDB       : ${GREEN}http://${HOST_IP}:8086${NC}"
   echo -e "  PHP site       : ${GREEN}http://${HOST_IP}:80${NC}"
   echo -e "  MQTT           : ${GREEN}${HOST_IP}:1883${NC}"
+
+  if [[ "$AUTO_CONFIG_HA_INFLUXDB" != "1" ]]; then
+    echo ""
+    warn "Manual step (optional): In Home Assistant add the InfluxDB integration (v2) pointing to http://127.0.0.1:8086"
+    warn "Token/Org/Bucket are in: $SCRIPT_DIR/.env"
+  fi
 }
 
 main "$@"
