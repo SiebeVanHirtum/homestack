@@ -528,10 +528,21 @@ configure_ha_influxdb_inline() {
 
   if grep -qE '^[[:space:]]*influxdb:' "$ha_conf"; then
     log "InfluxDB block already present in configuration.yaml."
-    # Remove any deprecated connection/auth keys that would trigger HA warnings
-    local deprecated_keys="api_version|host|port|ssl|verify_ssl|ssl_ca_cert|username|password|database|token|organization|bucket|path"
-    sed_inplace_delete "$ha_conf" "/^[[:space:]]*\(${deprecated_keys}\):[[:space:]]*/d"
-    log "Removed deprecated InfluxDB connection keys from configuration.yaml (HA 2026.9+ compatibility)."
+    log "Removing deprecated InfluxDB connection keys (HA 2026.9+ compatibility)..."
+
+    # Delete each deprecated key individually — one sed -i per key is the most
+    # portable approach and avoids BRE alternation issues across sed versions.
+    local key
+    for key in api_version host port ssl verify_ssl ssl_ca_cert \
+                username password database token organization bucket path; do
+      if file_is_writable "$ha_conf"; then
+        sed -i "/^[[:space:]]*${key}:[[:space:]]*/d" "$ha_conf" || true
+      else
+        sudo sed -i "/^[[:space:]]*${key}:[[:space:]]*/d" "$ha_conf" || true
+      fi
+    done
+
+    log "Deprecated InfluxDB connection keys removed from configuration.yaml."
     return 0
   fi
 
