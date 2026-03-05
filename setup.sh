@@ -72,6 +72,13 @@ setup_php_app() {
     fi
     info "Cloning HA-Configurator into $PHP_APP_DIR..."
     git clone https://github.com/SiebeVanHirtum/HA-Configurator.git "$PHP_APP_DIR"
+
+    # Copy .env.example to .env if not already present
+    if [ ! -f "$PHP_APP_DIR/.env" ] && [ -f "$PHP_APP_DIR/.env.example" ]; then
+      info "Copying .env.example to .env for PHP app..."
+      cp "$PHP_APP_DIR/.env.example" "$PHP_APP_DIR/.env"
+      warn "Review and edit $PHP_APP_DIR/.env with your actual values!"
+    fi
   fi
 }
 
