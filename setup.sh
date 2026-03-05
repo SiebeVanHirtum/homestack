@@ -8,10 +8,6 @@ DATA_DIR="$SCRIPT_DIR/data"
 PHP_REPO_URL="https://github.com/SiebeVanHirtum/HA-Configurator"
 PHP_REPO_BRANCH="main"
 
-# 1 = write Home Assistant InfluxDB config automatically (INLINE token; no secrets => no recovery-mode from missing secrets)
-# 0 = do not touch HA config (manual HA integration setup)
-AUTO_CONFIG_HA_INFLUXDB="${AUTO_CONFIG_HA_INFLUXDB:-1}"
-
 DOCKER="docker"
 COMPOSE=""
 
@@ -679,6 +675,92 @@ restart_homeassistant() {
   $DOCKER restart homeassistant >/dev/null 2>&1 || true
 }
 
+wait_for_influxdb_ready() {
+  # Poll InfluxDB /health endpoint; short timeout since it usually starts in <15s
+  local timeout="${1:-60}"
+  local start_ts now_ts
+  start_ts="$(date +%s)"
+
+  log "Waiting for InfluxDB to be ready (timeout: ${timeout}s)..."
+  while true; do
+    if $DOCKER exec influxdb influx ping --host http://localhost:8086 >/dev/null 2>&1; then
+      log "InfluxDB is ready."
+      return 0
+    fi
+    now_ts="$(date +%s)"
+    if (( now_ts - start_ts > timeout )); then
+      warn "InfluxDB did not become ready within ${timeout}s."
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+provision_influxdb() {
+  # Only provision on first install (no bolt file yet when this runs, but InfluxDB
+  # may have just created it). Use the DOCKER_INFLUXDB_INIT_* env vars approach:
+  # the official image handles setup automatically when those vars are set.
+  # This function verifies setup completed and ensures the token in .env matches reality.
+
+  local bolt="$DATA_DIR/influxdb/influxd.bolt"
+  local env_file="$SCRIPT_DIR/.env"
+
+  local tok org bucket user pass
+  tok="$(read_env_var INFLUXDB_TOKEN 2>/dev/null || echo "")"
+  org="$(read_env_var INFLUXDB_ORG 2>/dev/null || echo "homestack")"
+  bucket="$(read_env_var INFLUXDB_BUCKET 2>/dev/null || echo "home")"
+  user="$(read_env_var INFLUXDB_USER 2>/dev/null || echo "admin")"
+  pass="$(read_env_var INFLUXDB_PASSWORD 2>/dev/null || echo "adminpassword")"
+
+  # Wait for InfluxDB to be ready (short timeout)
+  if ! wait_for_influxdb_ready 60; then
+    warn "InfluxDB not ready; skipping provisioning. HA config already written with token from .env."
+    return 0
+  fi
+
+  # Check if already set up (bolt exists means init already ran)
+  if [[ -f "$bolt" ]]; then
+    log "InfluxDB already initialized. Verifying token is usable..."
+    # Try a quick auth check; if it fails, warn but don't abort
+    if $DOCKER exec influxdb influx bucket list \
+        --host http://localhost:8086 \
+        --token "$tok" \
+        --org "$org" >/dev/null 2>&1; then
+      log "InfluxDB token verified OK."
+    else
+      warn "InfluxDB token check failed — token in .env may be stale. Re-run setup to re-provision."
+    fi
+    return 0
+  fi
+
+  log "Provisioning InfluxDB: creating org='$org', bucket='$bucket', user='$user'..."
+
+  # Use the influx CLI inside the container to set up (works even if DOCKER_INFLUXDB_INIT_* vars
+  # were not passed to the container — this is the manual setup path)
+  if $DOCKER exec influxdb influx setup \
+      --host http://localhost:8086 \
+      --username "$user" \
+      --password "$pass" \
+      --org "$org" \
+      --bucket "$bucket" \
+      --token "$tok" \
+      --force >/dev/null 2>&1; then
+    log "InfluxDB setup completed via CLI."
+  else
+    warn "influx setup returned non-zero (may already be initialized). Continuing."
+  fi
+
+  # Verify the token works after setup
+  if $DOCKER exec influxdb influx bucket list \
+      --host http://localhost:8086 \
+      --token "$tok" \
+      --org "$org" >/dev/null 2>&1; then
+    log "InfluxDB provisioning verified: bucket '$bucket' accessible with configured token."
+  else
+    warn "Could not verify InfluxDB bucket access. Check token/org in .env."
+  fi
+}
+
 main() {
   log "=== Homestack Setup ==="
   log "Script directory: $SCRIPT_DIR"
@@ -692,12 +774,10 @@ main() {
 
   ensure_influx_token
 
-  # IMPORTANT: if you want "it never breaks HA parsing", avoid secrets entirely.
-  if [[ "$AUTO_CONFIG_HA_INFLUXDB" == "1" ]]; then
-    configure_ha_influxdb_inline
-  else
-    warn "AUTO_CONFIG_HA_INFLUXDB=0 -> not modifying Home Assistant config for InfluxDB."
-  fi
+  # Write InfluxDB config into HA configuration.yaml BEFORE starting the stack.
+  # This way HA boots with the config already present — no restart needed on first install,
+  # which prevents recovery mode caused by a mid-boot config reload.
+  configure_ha_influxdb_inline
 
   # Detect whether HA container already existed before this run (rerun vs fresh)
   local HA_ALREADY_EXISTS=0
@@ -706,14 +786,18 @@ main() {
   fi
 
   start_stack
+
+  # Provision InfluxDB (create org/bucket/token via CLI) after it starts
+  provision_influxdb
+
   install_php_site_from_github
 
-  # Avoid restarting HA immediately on first boot (can trigger recovery mode on some setups)
+  # On re-runs: restart HA so it picks up any config changes.
+  # On first install: HA already started with the correct config — no restart needed.
   if (( HA_ALREADY_EXISTS == 1 )); then
     restart_homeassistant
   else
-    log "First install detected: not restarting Home Assistant immediately."
-    wait_for_ha_initialized 120 || true
+    log "First install: Home Assistant started with InfluxDB config already in place — no restart needed."
   fi
 
   echo ""
@@ -729,12 +813,9 @@ main() {
   echo -e "  InfluxDB       : ${GREEN}http://${HOST_IP}:8086${NC}"
   echo -e "  PHP site       : ${GREEN}http://${HOST_IP}:80${NC}"
   echo -e "  MQTT           : ${GREEN}${HOST_IP}:1883${NC}"
-
-  if [[ "$AUTO_CONFIG_HA_INFLUXDB" != "1" ]]; then
-    echo ""
-    warn "Manual step (optional): In Home Assistant add the InfluxDB integration (v2) pointing to http://127.0.0.1:8086"
-    warn "Token/Org/Bucket are in: $SCRIPT_DIR/.env"
-  fi
+  echo ""
+  log "InfluxDB org/bucket/token are stored in: $SCRIPT_DIR/.env"
+  log "HA configuration.yaml has been updated with the InfluxDB integration block."
 }
 
 main "$@"
