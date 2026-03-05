@@ -57,6 +57,8 @@ create_dirs() {
     "$ROOT_DIR/data/mosquitto/data" \
     "$ROOT_DIR/data/mosquitto/log" \
     "$PHP_APP_DIR"
+
+  chown -R 1000:1000 "$NR_DATA_DIR"
 }
 
 # ─── 3. Clone / update PHP app (HA-Configurator) ─────────────────────────────
