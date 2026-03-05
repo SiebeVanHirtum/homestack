@@ -84,6 +84,7 @@ apt_update_retry() {
 
 apt_install_retry() {
   # usage: apt_install_retry pkg1 pkg2 ...
+  # Only retries on lock contention, NOT on missing packages (avoids infinite loops).
   local tries=3
   local i
   for ((i=1; i<=tries; i++)); do
@@ -92,9 +93,13 @@ apt_install_retry() {
     if sudo apt-get install -y "$@"; then
       return 0
     fi
+    # If the package simply doesn't exist, retrying won't help — bail immediately.
+    if sudo apt-get install -y --dry-run "$@" 2>&1 | grep -q "Unable to locate package"; then
+      warn "Package(s) not found in apt repos: $*"
+      return 1
+    fi
     warn "apt-get install failed (attempt $i/$tries). Retrying in 10s..."
     sleep 10
-    apt_update_retry 2 || true
   done
   return 1
 }
@@ -159,21 +164,31 @@ install_docker_and_compose() {
 
   if [[ -z "$COMPOSE" ]]; then
     log "Installing Docker Compose (trying apt packages)..."
-    if apt_install_retry docker-compose-v2; then
-      :
-    elif apt_install_retry docker-compose-plugin; then
-      :
-    elif apt_install_retry docker-compose; then
-      :
-    else
-      # Last resort: pipx docker-compose (works broadly on Debian snapshots)
-      warn "Could not install Compose via apt. Falling back to pipx docker-compose..."
-      apt_install_retry python3 python3-venv pipx || err "Failed to install pipx prerequisites."
-      pipx ensurepath >/dev/null 2>&1 || true
-      command -v pipx &>/dev/null || err "pipx not available after install; cannot continue."
-      pipx install docker-compose || true
-      if [[ -x "$HOME/.local/bin/docker-compose" ]]; then
-        sudo ln -sf "$HOME/.local/bin/docker-compose" /usr/local/bin/docker-compose || true
+    local compose_installed=0
+
+    # Try each package name once — stop as soon as one succeeds.
+    # Use a plain apt-get install (no retry loop) so a missing package name
+    # doesn't cause repeated apt-get update cycles.
+    for pkg in docker-compose-plugin docker-compose; do
+      log "Trying: apt-get install -y $pkg"
+      if sudo apt-get install -y "$pkg" 2>/dev/null; then
+        compose_installed=1
+        break
+      else
+        warn "$pkg not available in apt repos, trying next option..."
+      fi
+    done
+
+    if (( compose_installed == 0 )); then
+      # Last resort: pipx (works broadly on Debian/Ubuntu snapshots)
+      warn "No Compose apt package found. Falling back to pipx docker-compose..."
+      if sudo apt-get install -y python3 python3-venv pipx 2>/dev/null || \
+         sudo apt-get install -y python3 python3-pip 2>/dev/null; then
+        pipx ensurepath >/dev/null 2>&1 || true
+        if command -v pipx &>/dev/null && pipx install docker-compose 2>/dev/null; then
+          [[ -x "$HOME/.local/bin/docker-compose" ]] && \
+            sudo ln -sf "$HOME/.local/bin/docker-compose" /usr/local/bin/docker-compose || true
+        fi
       fi
     fi
   fi
