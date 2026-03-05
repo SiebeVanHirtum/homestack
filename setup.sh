@@ -506,48 +506,25 @@ ensure_influx_token() {
 }
 
 configure_ha_influxdb_inline() {
+  # HA 2026.9+ deprecates YAML-based connection/auth keys for InfluxDB.
+  # Connection is configured via the UI; only data-shaping keys remain in YAML.
+  # The InfluxDB integration must be added via the UI (Settings > Devices & Services > Add Integration > InfluxDB).
   local ha_conf="$DATA_DIR/homeassistant/configuration.yaml"
 
-  local tok org bucket
-  tok="$(read_env_var INFLUXDB_TOKEN 2>/dev/null || echo "")"
-  org="$(read_env_var INFLUXDB_ORG 2>/dev/null || echo "homestack")"
-  bucket="$(read_env_var INFLUXDB_BUCKET 2>/dev/null || echo "home")"
-
-  [[ -n "$tok" && "$tok" != "changeme-token" ]] || err "INFLUXDB_TOKEN is missing/invalid in .env (cannot auto-configure HA)."
-
-  # YAML single-quoted scalars; safer for tokens
-  local tok_q org_q bucket_q
-  tok_q="$(yaml_single_quote_escape "$tok")"
-  org_q="$(yaml_single_quote_escape "$org")"
-  bucket_q="$(yaml_single_quote_escape "$bucket")"
-
   if grep -qE '^[[:space:]]*influxdb:' "$ha_conf"; then
-    # If user already has an influxdb block, do NOT try to reformat it.
-    # BUT: if it references secrets that might not exist, replace those lines with inline values.
-    log "Home Assistant configuration.yaml already has influxdb: block; ensuring it does not depend on missing secrets."
-
-    local tok_repl org_repl bucket_repl
-    tok_repl="$(sed_escape_repl "token: '${tok_q}'")"
-    org_repl="$(sed_escape_repl "organization: '${org_q}'")"
-    bucket_repl="$(sed_escape_repl "bucket: '${bucket_q}'")"
-
-    sed_inplace_replace "$ha_conf" "s#^[[:space:]]*token:[[:space:]]*!secret[[:space:]]\+influxdb_token[[:space:]]*\$#  ${tok_repl}#"
-    sed_inplace_replace "$ha_conf" "s#^[[:space:]]*organization:[[:space:]]*!secret[[:space:]]\+influxdb_org[[:space:]]*\$#  ${org_repl}#"
-    sed_inplace_replace "$ha_conf" "s#^[[:space:]]*bucket:[[:space:]]*!secret[[:space:]]\+influxdb_bucket[[:space:]]*\$#  ${bucket_repl}#"
+    log "InfluxDB block already present in configuration.yaml."
+    # Remove any deprecated connection/auth keys that would trigger HA warnings
+    local deprecated_keys="api_version|host|port|ssl|verify_ssl|ssl_ca_cert|username|password|database|token|organization|bucket|path"
+    sed_inplace_delete "$ha_conf" "/^[[:space:]]*\(${deprecated_keys}\):[[:space:]]*/d"
+    log "Removed deprecated InfluxDB connection keys from configuration.yaml (HA 2026.9+ compatibility)."
     return 0
   fi
 
-  log "Adding InfluxDB v2 integration to Home Assistant configuration.yaml (INLINE token; no secrets)."
-  append_file "$ha_conf" "$(cat <<EOF
+  log "Adding InfluxDB data-shaping config to Home Assistant configuration.yaml."
+  log "NOTE: You must add the InfluxDB integration via the HA UI (Settings > Devices & Services > Add Integration > InfluxDB)."
+  append_file "$ha_conf" "$(cat <<'EOF'
 
 influxdb:
-  api_version: 2
-  host: 127.0.0.1
-  port: 8086
-  ssl: false
-  token: '${tok_q}'
-  organization: '${org_q}'
-  bucket: '${bucket_q}'
   tags:
     source: HA
   tags_attributes:
@@ -815,7 +792,10 @@ main() {
   echo -e "  MQTT           : ${GREEN}${HOST_IP}:1883${NC}"
   echo ""
   log "InfluxDB org/bucket/token are stored in: $SCRIPT_DIR/.env"
-  log "HA configuration.yaml has been updated with the InfluxDB integration block."
+  echo ""
+  warn "Manual step required: Add the InfluxDB integration via the HA UI:"
+  warn "  Settings > Devices & Services > Add Integration > InfluxDB"
+  warn "  URL: http://influxdb:8086  |  Token/Org/Bucket: see $SCRIPT_DIR/.env"
 }
 
 main "$@"
