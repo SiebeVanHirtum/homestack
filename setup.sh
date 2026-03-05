@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HA_CONFIG_DIR="$ROOT_DIR/data/homeassistant"
 NR_DATA_DIR="$ROOT_DIR/data/nodered"
 MOSQUITTO_CONFIG_DIR="$ROOT_DIR/data/mosquitto/config"
+PHP_APP_DIR="$ROOT_DIR/data/php/app"
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -55,10 +56,26 @@ create_dirs() {
     "$ROOT_DIR/data/mosquitto/config" \
     "$ROOT_DIR/data/mosquitto/data" \
     "$ROOT_DIR/data/mosquitto/log" \
-    "$ROOT_DIR/data/php/app"
+    "$PHP_APP_DIR"
 }
 
-# ─── 3. Mosquitto config ──────────────────────────────────────────────────────
+# ─── 3. Clone / update PHP app (HA-Configurator) ─────────────────────────────
+setup_php_app() {
+  if [ -d "$PHP_APP_DIR/.git" ]; then
+    info "Updating existing HA-Configurator repo in $PHP_APP_DIR..."
+    git -C "$PHP_APP_DIR" pull --ff-only || warn "Git pull failed, continuing with existing code."
+  else
+    if [ -n "$(ls -A "$PHP_APP_DIR" 2>/dev/null)" ]; then
+      warn "PHP app dir $PHP_APP_DIR is not empty and not a git repo; skipping clone."
+      warn "If you want HA-Configurator here, clean the directory and rerun setup.sh."
+      return
+    fi
+    info "Cloning HA-Configurator into $PHP_APP_DIR..."
+    git clone https://github.com/SiebeVanHirtum/HA-Configurator.git "$PHP_APP_DIR"
+  fi
+}
+
+# ─── 4. Mosquitto config ──────────────────────────────────────────────────────
 setup_mosquitto() {
   local conf="$MOSQUITTO_CONFIG_DIR/mosquitto.conf"
   if [ -f "$conf" ]; then
@@ -80,11 +97,12 @@ log_dest file /mosquitto/log/mosquitto.log
 EOF
 }
 
-# ─── 4. HA configuration.yaml ────────────────────────────────────────────────
-# IMPORTANT: We write configuration.yaml BEFORE starting HA to avoid safe mode.
-# HA 2026.3+ auto-imports the influxdb connection settings into the UI.
-# After first boot you can remove the connection keys (host/token/org/bucket)
-# from configuration.yaml — HA will show a repair notice guiding you.
+# ─── 5. HA configuration.yaml ────────────────────────────────────────────────
+# IMPORTANT: Write configuration.yaml BEFORE starting HA to avoid safe mode.
+# Up-to-date pattern:
+# - Connection settings (host/token/org/bucket/api_version) are still supported
+#   in YAML now, but HA 2026.3+ auto-imports them into the InfluxDB integration
+#   in the UI and will deprecate the YAML connection in 2026.9.0.
 setup_ha_config() {
   local config="$HA_CONFIG_DIR/configuration.yaml"
   if [ -f "$config" ]; then
@@ -104,16 +122,17 @@ automation: !include automations.yaml
 script: !include scripts.yaml
 scene: !include scenes.yaml
 
-# ─── InfluxDB 2.x Integration ─────────────────────────────────────────────────
-# NOTE (HA 2026.3+): Connection settings below will be auto-imported into the UI
-# (Settings → Devices & Services → InfluxDB) on first HA start.
-# After that, HA will show a repair notice asking you to remove the connection
-# keys (host, token, organization, bucket, api_version, ssl) from here.
-# The include/exclude/tags options remain in YAML permanently.
+# ─── InfluxDB 2.x Integration (current recommended pattern) ───────────────────
+# Connection config is still valid YAML today and will be auto-imported into
+# the UI (Settings → Devices & Services → InfluxDB) on first start.
+# After import, HA will ask you (via a Repair) to remove connection keys
+# (api_version/host/port/ssl/token/organization/bucket) from YAML.
+# Filters (include/exclude/tags) remain YAML-only, per docs:
+# https://www.home-assistant.io/integrations/influxdb/
 influxdb:
   api_version: 2
   ssl: false
-  host: influxdb
+  host: localhost
   port: 8086
   token: ${INFLUXDB_TOKEN}
   organization: ${INFLUXDB_ORG}
@@ -144,9 +163,9 @@ EOF
   touch "$HA_CONFIG_DIR/scenes.yaml"
 }
 
-# ─── 5. HA Dashboards ─────────────────────────────────────────────────────────
-# Dashboards are installed as YAML-mode dashboards via configuration.yaml.
-# Each .yaml file in homeassistant/dashboards/ becomes a sidebar dashboard.
+# ─── 6. HA Dashboards (YAML) ─────────────────────────────────────────────────
+# Each *.yaml in homeassistant/dashboards/ becomes a YAML dashboard registered
+# in lovelace: dashboards: and shown in the sidebar.
 setup_ha_dashboards() {
   local dashboard_src="$ROOT_DIR/homeassistant/dashboards"
   if [ ! -d "$dashboard_src" ] || [ -z "$(ls -A "$dashboard_src"/*.yaml 2>/dev/null)" ]; then
@@ -159,18 +178,17 @@ setup_ha_dashboards() {
   local dashboards_dir="$HA_CONFIG_DIR/dashboards"
   mkdir -p "$dashboards_dir"
 
-  # Build lovelace dashboard entries
   local lovelace_block="lovelace:\n  dashboards:"
 
   for yaml_file in "$dashboard_src"/*.yaml; do
     local filename
     filename="$(basename "$yaml_file")"
     local slug="${filename%.yaml}"
-    # Sanitize slug: lowercase, replace underscores/spaces with hyphens
+    # Slug for ID
     local safe_slug
-    safe_slug="$(echo "$slug" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr ' ' '-')"
+    safe_slug="$(echo "$slug" | tr '[:upper:]' '[:lower:]' | tr '_ ' '-')"
+    # Human-readable title
     local title
-    # Title: capitalize words, replace hyphens/underscores with spaces
     title="$(echo "$slug" | tr '_-' ' ' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2))}1')"
 
     info "  → Dashboard: $title ($filename)"
@@ -179,15 +197,16 @@ setup_ha_dashboards() {
     lovelace_block="$lovelace_block\n    lovelace-${safe_slug}:\n      mode: yaml\n      filename: dashboards/${filename}\n      title: \"${title}\"\n      show_in_sidebar: true\n      icon: mdi:view-dashboard"
   done
 
-  # Append lovelace block to configuration.yaml if not already present
   if grep -q "^lovelace:" "$config"; then
-    warn "lovelace: block already in configuration.yaml, skipping dashboard injection."
+    warn "lovelace: already defined in configuration.yaml, NOT modifying it."
+    warn "If you want automatic dashboard registration, remove existing lovelace:"
+    warn "and rerun setup.sh, or add dashboards manually per docs."
   else
     echo -e "\n$lovelace_block" >> "$config"
   fi
 }
 
-# ─── 6. Node-RED flows ────────────────────────────────────────────────────────
+# ─── 7. Node-RED flows ────────────────────────────────────────────────────────
 setup_nodered_flows() {
   local flows_src="$ROOT_DIR/nodered/flows.json"
   if [ ! -f "$flows_src" ]; then
@@ -198,7 +217,7 @@ setup_nodered_flows() {
   cp "$flows_src" "$NR_DATA_DIR/flows.json"
 }
 
-# ─── 7. Start Docker Compose ──────────────────────────────────────────────────
+# ─── 8. Start Docker Compose ──────────────────────────────────────────────────
 start_services() {
   info "Pulling Docker images..."
   cd "$ROOT_DIR"
@@ -207,29 +226,32 @@ start_services() {
   info "Building custom images (php-fpm)..."
   docker compose build
 
-  info "Starting services..."
-  # Start dependencies first, then everything
+  info "Starting base services (mosquitto, influxdb)..."
   docker compose up -d mosquitto influxdb
   info "Waiting 15s for InfluxDB to initialize..."
   sleep 15
 
+  info "Starting remaining services..."
   docker compose up -d
   info "All services started."
 }
 
-# ─── 8. Status ────────────────────────────────────────────────────────────────
+# ─── 9. Status ────────────────────────────────────────────────────────────────
 print_status() {
+  local ip
+  ip="$(hostname -I | awk '{print $1}')"
+
   echo ""
   info "═══════════════════════════════════════════════════"
   info " Setup complete! Service URLs:"
-  info "   Home Assistant : http://$(hostname -I | awk '{print $1}'):8123"
-  info "   Node-RED       : http://$(hostname -I | awk '{print $1}'):1880"
-  info "   InfluxDB       : http://$(hostname -I | awk '{print $1}'):8086"
-  info "   MQTT           : mqtt://$(hostname -I | awk '{print $1}'):1883"
-  info "   PHP/Nginx      : http://$(hostname -I | awk '{print $1}'):80"
+  info "   Home Assistant : http://$ip:8123"
+  info "   Node-RED       : http://$ip:1880"
+  info "   InfluxDB       : http://$ip:8086"
+  info "   MQTT           : mqtt://$ip:1883"
+  info "   PHP/Nginx      : http://$ip:80"
   info "═══════════════════════════════════════════════════"
   echo ""
-  warn "InfluxDB credentials:"
+  warn "InfluxDB credentials (from .env):"
   warn "  User     : $INFLUXDB_USER"
   warn "  Password : $INFLUXDB_PASSWORD"
   warn "  Org      : $INFLUXDB_ORG"
@@ -237,12 +259,15 @@ print_status() {
   warn "  Token    : $INFLUXDB_TOKEN"
   echo ""
   warn "NEXT STEPS:"
-  warn "  1. Wait ~60s for Home Assistant to fully start"
-  warn "  2. Complete HA onboarding at http://$(hostname -I | awk '{print $1}'):8123"
-  warn "  3. HA will auto-import InfluxDB connection into Settings → Devices & Services"
-  warn "  4. HA 2026.3+: After first boot, follow the repair notice to remove"
-  warn "     connection keys from configuration.yaml (host/token/org/bucket)"
-  warn "  5. Your dashboards are available in the HA sidebar"
+  warn "  1. Wait ~60s for Home Assistant to fully start."
+  warn "  2. Complete HA onboarding at http://$ip:8123."
+  warn "  3. Go to Settings → Devices & Services → InfluxDB."
+  warn "     The InfluxDB integration should already exist from YAML import."
+  warn "  4. When HA shows a Repair about 'InfluxDB YAML configuration being"
+  warn "     removed', follow it: remove connection keys from configuration.yaml"
+  warn "     and keep your include/exclude/tags there."
+  warn "  5. Your YAML dashboards should appear in the sidebar."
+  warn "  6. HA-Configurator PHP app should be served at http://$ip/ by php-nginx."
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -250,9 +275,10 @@ main() {
   info "Starting HomeStack setup..."
   install_docker
   create_dirs
+  setup_php_app
   setup_mosquitto
-  setup_ha_config        # Must run BEFORE starting HA container
-  setup_ha_dashboards    # Must run BEFORE starting HA container
+  setup_ha_config        # BEFORE starting HA
+  setup_ha_dashboards    # BEFORE starting HA
   setup_nodered_flows
   start_services
   print_status
