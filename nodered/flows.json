@@ -1,36 +1,5 @@
 [
     {
-        "id": "f6f2187d.f17ca8",
-        "type": "tab",
-        "label": "Flow 1",
-        "disabled": false,
-        "info": ""
-    },
-    {
-        "id": "8a2a0c24628155e9",
-        "type": "junction",
-        "z": "f6f2187d.f17ca8",
-        "x": 590,
-        "y": 240,
-        "wires": [
-            [
-                "ed039145310c3a30"
-            ]
-        ]
-    },
-    {
-        "id": "ed039145310c3a30",
-        "type": "junction",
-        "z": "f6f2187d.f17ca8",
-        "x": 1330,
-        "y": 240,
-        "wires": [
-            [
-                "7660fe5129ecd669"
-            ]
-        ]
-    },
-    {
         "id": "dc077abf5376b472",
         "type": "function",
         "z": "f6f2187d.f17ca8",
@@ -262,6 +231,109 @@
         "outputs": 1,
         "x": 1280,
         "y": 180,
+        "wires": [
+            [
+                "7660fe5129ecd669"
+            ]
+        ]
+    },
+    {
+        "id": "c213a855cb474a16",
+        "type": "http in",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "url": "/add-zigbee-device",
+        "method": "post",
+        "upload": false,
+        "skipBodyParsing": false,
+        "x": 170,
+        "y": 420,
+        "wires": [
+            [
+                "b24daeb60368cf83",
+                "87bce2988f18cff7"
+            ]
+        ]
+    },
+    {
+        "id": "b24daeb60368cf83",
+        "type": "change",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "rules": [
+            {
+                "t": "set",
+                "p": "payload",
+                "pt": "msg",
+                "to": "Zigbee apparaat wordt toegevoegd...",
+                "tot": "str"
+            }
+        ],
+        "x": 410,
+        "y": 360,
+        "wires": [
+            [
+                "3a29cd5a2b6db72a"
+            ]
+        ]
+    },
+    {
+        "id": "3a29cd5a2b6db72a",
+        "type": "http response",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "statusCode": "",
+        "headers": {},
+        "x": 620,
+        "y": 360,
+        "wires": []
+    },
+    {
+        "id": "87bce2988f18cff7",
+        "type": "function",
+        "z": "f6f2187d.f17ca8",
+        "name": "Zigbee Discovery",
+        "func": "const user = msg.payload.user_input;\nconst deviceDef = msg.payload.device_config;\nlet messages = [];\n\ndeviceDef.entities.forEach(entity => {\n    let displayName = user.friendly_name;\n    if (entity.id !== 'switch') {\n        displayName += \" \" + (entity.config.name || entity.id.charAt(0).toUpperCase() + entity.id.slice(1));\n    }\n\n    let discoveryPayload = {\n        \"name\": displayName,\n        \"unique_id\": user.device_id + entity.suffix,\n        \"device\": {\n            \"identifiers\": [user.device_id],\n            \"name\": user.friendly_name,\n            \"model\": deviceDef.device_info.model,\n            \"manufacturer\": deviceDef.device_info.manufacturer\n        }\n    };\n\n    Object.assign(discoveryPayload, entity.config);\n\n    // Zigbee2MQTT publishes to zigbee2mqtt/<friendly_name>/<property>\n    // State topic uses the Zigbee2MQTT device name (device_id)\n    discoveryPayload.state_topic = \"zigbee2mqtt/\" + user.device_id;\n\n    if (entity.config.command_topic) {\n        discoveryPayload.command_topic = \"zigbee2mqtt/\" + user.device_id + \"/set\";\n    }\n\n    messages.push({\n        topic: `homeassistant/${entity.type}/${user.device_id}${entity.suffix}/config`,\n        payload: discoveryPayload,\n        retain: true\n    });\n});\n\nreturn [messages];\n",
+        "outputs": 1,
+        "x": 410,
+        "y": 460,
+        "wires": [
+            [
+                "e69dd6c1ee051d80"
+            ]
+        ]
+    },
+    {
+        "id": "e69dd6c1ee051d80",
+        "type": "mqtt out",
+        "z": "f6f2187d.f17ca8",
+        "name": "",
+        "topic": "",
+        "qos": "",
+        "retain": "true",
+        "broker": "13f7a29328fc8e4e",
+        "x": 620,
+        "y": 460,
+        "wires": []
+    },
+    {
+        "id": "8a2a0c24628155e9",
+        "type": "junction",
+        "z": "f6f2187d.f17ca8",
+        "x": 590,
+        "y": 240,
+        "wires": [
+            [
+                "ed039145310c3a30"
+            ]
+        ]
+    },
+    {
+        "id": "ed039145310c3a30",
+        "type": "junction",
+        "z": "f6f2187d.f17ca8",
+        "x": 1330,
+        "y": 240,
         "wires": [
             [
                 "7660fe5129ecd669"
