@@ -6,6 +6,7 @@ HA_CONFIG_DIR="$ROOT_DIR/data/homeassistant"
 NR_DATA_DIR="$ROOT_DIR/data/nodered"
 MOSQUITTO_CONFIG_DIR="$ROOT_DIR/data/mosquitto/config"
 PHP_APP_DIR="$ROOT_DIR/data/php/app"
+Z2M_DATA_DIR="$ROOT_DIR/data/zigbee2mqtt"
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -56,7 +57,8 @@ create_dirs() {
     "$ROOT_DIR/data/mosquitto/config" \
     "$ROOT_DIR/data/mosquitto/data" \
     "$ROOT_DIR/data/mosquitto/log" \
-    "$PHP_APP_DIR"
+    "$PHP_APP_DIR" \
+    "$Z2M_DATA_DIR"
 
   chown -R 1000:1000 "$NR_DATA_DIR"
 }
@@ -104,6 +106,39 @@ persistence true
 persistence_location /mosquitto/data/
 log_dest file /mosquitto/log/mosquitto.log
 EOF
+}
+
+# ─── 5. Zigbee2MQTT config ────────────────────────────────────────────────────
+setup_zigbee2mqtt() {
+  local conf="$Z2M_DATA_DIR/configuration.yaml"
+  if [ -f "$conf" ]; then
+    info "Zigbee2MQTT config already exists, skipping."
+    return
+  fi
+  info "Creating Zigbee2MQTT config..."
+  cat > "$conf" <<EOF
+homeassistant:
+  enabled: true
+  legacy_entity_attributes: false
+
+permit_join: false
+
+mqtt:
+  server: mqtt://mosquitto:1883
+
+serial:
+  port: /dev/ttyUSB1
+
+frontend:
+  enabled: true
+  port: 8080
+
+advanced:
+  log_level: info
+  network_key: GENERATE
+EOF
+  warn "Zigbee2MQTT config written. Check /dev/ttyUSB1 matches your Zigbee stick!"
+  warn "Run 'ls /dev/ttyUSB*' or 'ls /dev/ttyACM*' to find the correct port."
 }
 
 # ─── 5. HA configuration.yaml ────────────────────────────────────────────────
@@ -257,6 +292,7 @@ print_status() {
   info "   Node-RED       : http://$ip:1880"
   info "   InfluxDB       : http://$ip:8086"
   info "   MQTT           : mqtt://$ip:1883"
+  info "   Zigbee2MQTT    : http://$ip:8080"
   info "   PHP/Nginx      : http://$ip:80"
   info "═══════════════════════════════════════════════════"
   echo ""
@@ -286,6 +322,7 @@ main() {
   create_dirs
   setup_php_app
   setup_mosquitto
+  setup_zigbee2mqtt
   setup_ha_config        # BEFORE starting HA
   setup_ha_dashboards    # BEFORE starting HA
   setup_nodered_flows
