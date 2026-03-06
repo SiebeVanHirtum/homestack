@@ -8,8 +8,11 @@ services:
     restart: unless-stopped
     volumes:
       - ./data/homeassistant:/config
+      - /dev:/dev
     environment:
       - TZ=${TZ:-Europe/Brussels}
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
 
   nodered:
     image: nodered/node-red:latest
