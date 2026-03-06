@@ -127,7 +127,7 @@ mqtt:
   server: mqtt://mosquitto:1883
 
 serial:
-  port: /dev/ttyUSB1
+  port: /dev/ttyACM0
 
 frontend:
   enabled: true
