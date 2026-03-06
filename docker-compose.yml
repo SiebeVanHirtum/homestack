@@ -11,8 +11,6 @@ services:
       - /dev:/dev
     environment:
       - TZ=${TZ:-Europe/Brussels}
-    devices:
-      - /dev/ttyUSB0:/dev/ttyUSB0
 
   nodered:
     image: nodered/node-red:latest
@@ -60,6 +58,22 @@ services:
       - ./data/mosquitto/config:/mosquitto/config
       - ./data/mosquitto/data:/mosquitto/data
       - ./data/mosquitto/log:/mosquitto/log
+
+  zigbee2mqtt:
+    image: koenkk/zigbee2mqtt:latest
+    container_name: zigbee2mqtt
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data/zigbee2mqtt:/app/data
+      - /run/udev:/run/udev:ro
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
+    environment:
+      - TZ=${TZ:-Europe/Brussels}
+    depends_on:
+      - mosquitto
 
   php-fpm:
     build:
