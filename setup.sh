@@ -291,6 +291,7 @@ print_status() {
   info "   Home Assistant : http://$ip:8123"
   info "   Node-RED       : http://$ip:1880"
   info "   InfluxDB       : http://$ip:8086"
+  info "   Grafana        : http://$ip:3000"
   info "   MQTT           : mqtt://$ip:1883"
   info "   Zigbee2MQTT    : http://$ip:8080"
   info "   PHP/Nginx      : http://$ip:80"
