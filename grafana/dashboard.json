@@ -37,14 +37,9 @@
               {
                 "color": "green",
                 "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
               }
             ]
-          },
-          "unit": "short"
+          }
         },
         "overrides": [
           {
@@ -55,7 +50,7 @@
             "properties": [
               {
                 "id": "displayName",
-                "value": "${__field.labels.friendly_name}"
+                "value": "${__field.labels.friendly_name} (${__series.name})"
               }
             ]
           }
@@ -97,6 +92,25 @@
         }
       ],
       "title": "Current Values: ${device_id}",
+      "transformations": [
+        {
+          "id": "calculateField",
+          "options": {
+            "binary": {
+              "left": {
+                "fixed": ""
+              },
+              "right": {
+                "fixed": ""
+              }
+            },
+            "mode": "binary",
+            "reduce": {
+              "reducer": "sum"
+            }
+          }
+        }
+      ],
       "type": "stat"
     },
     {
@@ -143,7 +157,7 @@
               "mode": "off"
             }
           },
-          "displayName": "${__field.labels.friendly_name}",
+          "displayName": "${__field.labels.friendly_name} (${__series.name})",
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -207,8 +221,8 @@
     "list": [
       {
         "current": {
-          "text": "shellyplusplugs_e86beae87700",
-          "value": "shellyplusplugs_e86beae87700"
+          "text": "p1_meter",
+          "value": "p1_meter"
         },
         "datasource": {
           "type": "influxdb",
@@ -255,8 +269,8 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Device Dashboard",
-  "uid": "dynamic_dev",
-  "version": 1,
+  "title": "Clean Device Dashboard v9",
+  "uid": "dynamic_dev_009",
+  "version": 4,
   "weekStart": ""
 }
