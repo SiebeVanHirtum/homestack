@@ -261,7 +261,41 @@ setup_nodered_flows() {
   cp "$flows_src" "$NR_DATA_DIR/flows.json"
 }
 
-# ─── 8. Start Docker Compose ──────────────────────────────────────────────────
+# ─── 8. Grafana Provisioning ──────────────────────────────────────────────────
+setup_grafana_dashboard() {
+  local dashboard_src="$ROOT_DIR/grafana/dashboard.json"
+  local prov_dir="$ROOT_DIR/data/grafana/provisioning"
+  
+  if [ ! -f "$dashboard_src" ]; then
+    warn "grafana/dashboard.json not found, skipping dashboard setup."
+    return
+  fi
+
+  info "Setting up Grafana dashboard provisioning..."
+  mkdir -p "$prov_dir/dashboards" "$prov_dir/datasources"
+
+  # Create the provider configuration file
+  cat > "$prov_dir/dashboards/provider.yaml" <<EOF
+apiVersion: 1
+providers:
+  - name: 'HomeStack'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+EOF
+
+  # Copy the dashboard JSON to the provisioned data folder
+  cp "$dashboard_src" "$prov_dir/dashboards/dashboard.json"
+  
+  # Ensure correct permissions for the Grafana user (ID 472)
+  chown -R 472:472 "$ROOT_DIR/data/grafana"
+}
+
+# ─── 9. Start Docker Compose ──────────────────────────────────────────────────
 start_services() {
   info "Pulling Docker images..."
   cd "$ROOT_DIR"
@@ -280,7 +314,7 @@ start_services() {
   info "All services started."
 }
 
-# ─── 9. Status ────────────────────────────────────────────────────────────────
+# ─── 10. Status ────────────────────────────────────────────────────────────────
 print_status() {
   local ip
   ip="$(hostname -I | awk '{print $1}')"
@@ -327,6 +361,7 @@ main() {
   setup_ha_config        # BEFORE starting HA
   setup_ha_dashboards    # BEFORE starting HA
   setup_nodered_flows
+  setup_grafana_dashboard
   start_services
   print_status
 }
